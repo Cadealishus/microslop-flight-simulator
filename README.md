@@ -3,12 +3,99 @@ Open world flight simulator in pure rust created by Claude Fable 5.2 and Opus 5.
 # Demo
 [Demo](https://github.com/user-attachments/assets/4f8833da-13c0-4d20-a50b-c0acf2d88df1)
 
-
-
 # Play
 * **Windows:** install Rust from https://rustup.rs, then double-click `Run on Windows.bat` (see `README-WINDOWS.txt`).
 * **Mac:** install Rust, then double-click `Run on Mac.command` (see `README-MAC.txt`).
-* **Browser, no install:** https://cadealishus.github.io/microslop-flight-simulator-web-edition/
+* **Browser, no install:** https://cadealishus.github.io/microslop-flight-simulator-web-edition/ (Chrome or Edge)
+
+The first run on Windows or Mac builds the game from this source code, which takes several minutes. After that it starts straight away.
+
+# What's in it
+
+**The whole real world.** Fly anywhere on Earth. The ground is built as you fly from free online map data:
+* satellite imagery (Esri World Imagery), draped over real terrain heights (AWS Terrain Tiles)
+* buildings from OpenStreetMap at their mapped height, each with generated walls: brick, stone, glass towers, offices, houses, sheds, shops, lit windows at night
+* roads with traffic, trees and land cover, coastlines with breaking waves, and an ocean with swell
+* every airport in the database, with runways, taxiways, aprons, gates, runway lights, approach lights and airport traffic
+
+**Aircraft:** Cessna 172RG, King Air 350, Boeing 747-400 (and a FedUp freighter), F/A-18C Hornet, F-14A Tomcat, A-10C Thunderbolt II, F-117A Nighthawk, L-39ZA Albatros and C-17A Globemaster III. Each has its own flight model (weight, engines, lift, drag), working gear, flaps and control surfaces, and a cockpit with live instruments.
+
+**Weather and time:** clouds you can fly through, storms, wind and gusts, haze, sun and moon positions for the real date, and a day and night cycle. By default the weather is the live report (METAR) from the nearest airport, and real aircraft flying nearby (ADS-B) appear in the sky.
+
+**Crashes and damage:** parts can break off, engines can catch fire, and buildings can be knocked down.
+
+**Sound:** engines, wind, gear, flaps and cockpit warnings are made by a synthesizer as you fly, not from recordings (apart from the fighters' roar and the menu music).
+
+**Game modes**, from the main menu:
+* **Free Flight:** pick any spot or airport on the globe, an aircraft, the time and the weather.
+* **World Photographer:** a scenic spot with the HUD hidden; take photos with F12.
+* **Career:** a pilot's logbook with ranks, stats, achievements and delivery jobs between airports. Softer landings pay more.
+* **Challenge League:** five hard landings (San Francisco, St Maarten, Gibraltar, Queenstown, Courchevel), scored by how softly you touch down.
+* **Marketplace:** every aircraft, to pick from.
+
+# Controls
+
+| Key | Does |
+|---|---|
+| W / S or ↑ / ↓ | pitch (nose down / up) |
+| A / D or ← / → | roll |
+| Q / E | rudder |
+| Shift / Ctrl | throttle up / down |
+| B | wheel brakes |
+| Z | reverse thrust |
+| Space | afterburner / boost |
+| F / V | flaps down / up |
+| L | landing gear |
+| / | speedbrake |
+| C | cockpit or chase camera |
+| mouse drag, wheel | look around, zoom |
+| R | start again here |
+| G | go to a place or airport |
+| T / Y | time of day later / earlier |
+| N / M | more / fewer clouds |
+| F3 | weather panel |
+| K | set the heading indicator to the compass |
+| P | pause |
+| H | hide the HUD |
+| U | sound on / off |
+| Tab | flight panel |
+| Esc | pause menu |
+| F1 | help |
+| F2 | anti-aliasing on / off |
+| F12 | screenshot |
+
+**Gamepad (Xbox layout, as Microsoft Flight Simulator sets it up):** left stick pitch and roll, triggers rudder, hold A / B throttle up / down, hold X brakes, Y + B parking brake, Y + d-pad trim, bumpers flaps, left stick click gear, right stick look around, d-pad quick views, View button cockpit or chase camera, Menu button pause.
+
+# How it works
+
+**Everything is Rust** (no game engine): [wgpu](https://wgpu.rs) for the graphics, winit for the window and input, egui for the menus and HUD.
+
+**Loading the world** (`sources.rs`, `world.rs`): the Earth is cut into map tiles at several zoom levels, finer near the aircraft. For each tile in view, worker threads download the imagery, elevation and map data (`fetch.rs`), keep them in a disk cache, and build the meshes: terrain (`sources.rs`), buildings and roads (`buildings.rs`, `roads.rs`), trees (`trees.rs`), shorelines (`shore.rs`) and airfields (`airports.rs`, `airfield.rs`, `pave.rs`). The finished tiles go to the GPU, and tiles far behind are dropped.
+
+**Drawing** (`render.rs`, `src/shaders/*.wgsl`): the shaders draw the terrain, ocean, buildings (their walls are drawn in `facade.wgsl`, not stored as pictures), clouds, sky, aircraft and particles, then add shadows, ambient occlusion, haze, temporal anti-aliasing and the final colour grade.
+
+**Flying** (`plane.rs`, `airframe.rs`, `aircraft/`): each aircraft is a set of pieces (wings, tail, gear, surfaces...) with mass and aerodynamic shape. Every frame the forces on each piece are added up and the aircraft is moved in small steps. Contact points on the gear and airframe handle the ground, and crashes break pieces off (`damage.rs`, `crash.rs`, `destruct.rs`).
+
+**The rest:** `weather.rs` and `live.rs` (weather and real traffic), `traffic.rs` and `cars.rs` (airport and road traffic), `audio.rs` (the synthesizer), `menu.rs` (globe and menus), `career.rs` (logbook), `cockpit.rs` and `gauges.rs` (instruments), `plat.rs` (what differs between the desktop and the browser).
+
+**Saved on your computer:** downloaded map tiles in your user cache folder (`fablegame`), and the career logbook in `career.txt` next to the game.
+
+# Command-line options
+
+`cargo run --release -- <options>`, for example `--no-menu --airport KSFO --runway 28R`. The useful ones:
+
+| Option | Does |
+|---|---|
+| `--no-menu` | fly straight away |
+| `--airport KSFO`, `--runway 28R`, `--approach` | start on a runway, or on final approach |
+| `--lat`, `--lon`, `--agl`, `--heading` | start at a spot, height (m above ground) and heading |
+| `--place "Paris"` | start over a named place |
+| `--aircraft 747` | which aircraft: `c172`, `ka350`, `747`, `fedup`, `fa18`, `f14`, `a10`, `f117`, `l39`, `c17` |
+| `--time 18.5`, `--clouds 0.7`, `--wind 15,270` (knots, from degrees), `--storms 0.5` | time and weather |
+| `--cockpit` | start in the cockpit view |
+| `--offline` | use only the map cache (no downloads) |
+| `--mute`, `--no-hud`, `--no-vsync` | sound, HUD and vsync off |
+| `--help` | the full list |
 
 # Compiling
 * Install rust
@@ -21,8 +108,10 @@ running
 cargo run --release
 ```
 
-# Browser version
-The same game compiled to WebAssembly, drawn with WebGPU (Chrome or Edge; recent Safari and Firefox too).
+# Browser version (Web Edition)
+The same code also compiles to WebAssembly and draws with WebGPU in the browser. It's published at https://github.com/Cadealishus/microslop-flight-simulator-web-edition, which also has a JSFiddle launcher.
+
+What's different there (`plat.rs`): a browser page has one thread and can't wait on downloads, so the background work runs between frames, and downloads are started and checked on instead of waited for. A job that finds a file missing asks for everything it needs at once and runs again once it arrives. The career logbook goes in the browser's storage. Scenery loads slower than on the desktop. The live weather (METAR) and live traffic (ADS-B) feeds don't allow requests from web pages, so they're off there, and Google's tiles aren't available.
 
 Once:
 ```
@@ -36,9 +125,9 @@ Build (Windows PowerShell), then serve the `web` folder and open http://localhos
 python -m http.server 8000 --directory web
 ```
 
-Desktop options go in the address: `?no-menu&airport=KSFO&runway=28R` is `--no-menu --airport KSFO --runway 28R`.
+`build-web.ps1` compiles the game, splits the 73 MB game file into pieces of 18 MB or less (so the jsDelivr mirror will serve them) and writes `web/pkg/parts.json` listing them. `publish-web.ps1` builds and pushes it all to the Web Edition repo, which needs to be cloned into `browser-edition/`.
 
-In the browser all loading runs on the page's one thread, so scenery comes in slower than on the desktop. The live METAR weather and ADS-B traffic feeds don't allow requests from web pages, so they're off there, and Google's tiles aren't available.
+Desktop options go in the address: `?no-menu&airport=KSFO&runway=28R` is `--no-menu --airport KSFO --runway 28R`.
 
 # Contributions
 Please contribute anything if you want to! Improvements to flight sim realism, graphics, optimization, UI, and especially plane models are needed! (((=
