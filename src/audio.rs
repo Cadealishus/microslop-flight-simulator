@@ -128,17 +128,43 @@ struct Shared {
 
 pub struct Audio {
     shared: Arc<Shared>,
+    #[cfg(not(target_arch = "wasm32"))]
     _sink: Option<rodio::MixerDeviceSink>,
     /// a synth with no sound device, pulled by `take` (for recording videos)
     offline: Option<Mutex<Synth>>,
     /// the menu music and how far it is faded in (0..1)
+    #[cfg(not(target_arch = "wasm32"))]
     music: Option<(rodio::Player, Mutex<f32>)>,
+    #[cfg(target_arch = "wasm32")]
+    web: Option<web::WebAudio>,
 }
 
 /// The main menu's soundtrack ("Calme Anticipation").
 static MENU_MUSIC: &[u8] = include_bytes!("../assets/menu/menu.mp3");
 
 impl Audio {
+    /// The browser's sound: the synth pulled by the page's audio, and the menu music.
+    #[cfg(target_arch = "wasm32")]
+    pub fn new() -> Option<Self> {
+        let shared = Arc::new(Shared::default());
+        let w = web::WebAudio::new(Synth::new(shared.clone()), MENU_MUSIC)?;
+        Some(Self { shared, offline: None, web: Some(w) })
+    }
+    /// Browsers keep a page silent until it is clicked or typed into: call on every such input.
+    #[cfg(target_arch = "wasm32")]
+    pub fn wake(&self) {
+        if let Some(w) = &self.web {
+            w.wake();
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn music(&self, on: bool, dt: f32) {
+        if let Some(w) = &self.web {
+            w.music(on, dt);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Option<Self> {
         let sink = match rodio::DeviceSinkBuilder::open_default_sink() {
             Ok(s) => s,
@@ -163,6 +189,7 @@ impl Audio {
         Some(Self { shared, _sink: Some(sink), offline: None, music })
     }
     /// Fades the menu music in (`on`) or out over about a second; call every frame.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn music(&self, on: bool, dt: f32) {
         let Some((p, level)) = &self.music else { return };
         let mut v = level.lock();
@@ -178,7 +205,10 @@ impl Audio {
     pub fn offline() -> Self {
         let shared = Arc::new(Shared::default());
         let synth = Synth::new(shared.clone());
-        Self { shared, _sink: None, offline: Some(Mutex::new(synth)), music: None }
+        #[cfg(not(target_arch = "wasm32"))]
+        return Self { shared, _sink: None, offline: Some(Mutex::new(synth)), music: None };
+        #[cfg(target_arch = "wasm32")]
+        Self { shared, offline: Some(Mutex::new(synth)), web: None }
     }
     pub const RATE: u32 = RATE;
     /// The next `n` stereo samples of an offline synth (empty with a device).
@@ -1450,6 +1480,7 @@ impl Iterator for Synth {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl rodio::Source for Synth {
     fn current_span_len(&self) -> Option<usize> {
         None
@@ -1658,5 +1689,84 @@ mod tests {
             w.extend_from_slice(&s.to_le_bytes());
         }
         std::fs::write(&path, w).unwrap();
+    }
+}
+
+/// The browser's sound: the synth runs inside the page's audio callback, and
+/// the menu music is decoded by the browser and looped through a fader.
+#[cfg(target_arch = "wasm32")]
+mod web {
+    use super::{Synth, RATE};
+    use std::cell::{Cell, RefCell};
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
+
+    pub struct WebAudio {
+        ctx: web_sys::AudioContext,
+        music_gain: web_sys::GainNode,
+        level: Cell<f32>,
+        _proc: web_sys::ScriptProcessorNode,
+    }
+
+    impl WebAudio {
+        pub fn new(synth: Synth, mp3: &'static [u8]) -> Option<Self> {
+            let opts = web_sys::AudioContextOptions::new();
+            opts.set_sample_rate(RATE as f32);
+            let ctx = web_sys::AudioContext::new_with_context_options(&opts).map_err(|e| log::warn!("no sound: {e:?}")).ok()?;
+            let proc = ctx.create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(2048, 0, 2).ok()?;
+            let synth = RefCell::new(synth);
+            let cb = Closure::<dyn FnMut(web_sys::AudioProcessingEvent)>::new(move |e: web_sys::AudioProcessingEvent| {
+                let Ok(out) = e.output_buffer() else { return };
+                let n = out.length() as usize;
+                let (mut l, mut r) = (vec![0f32; n], vec![0f32; n]);
+                let mut s = synth.borrow_mut();
+                for i in 0..n {
+                    l[i] = s.next().unwrap_or(0.0);
+                    r[i] = s.next().unwrap_or(0.0);
+                }
+                let _ = out.copy_to_channel(&mut l, 0);
+                let _ = out.copy_to_channel(&mut r, 1);
+            });
+            proc.set_onaudioprocess(Some(cb.as_ref().unchecked_ref()));
+            cb.forget();
+            proc.connect_with_audio_node(&ctx.destination()).ok()?;
+            let music_gain = ctx.create_gain().ok()?;
+            music_gain.gain().set_value(0.0);
+            music_gain.connect_with_audio_node(&ctx.destination()).ok()?;
+            if let Ok(p) = ctx.decode_audio_data(&js_sys::Uint8Array::from(mp3).buffer()) {
+                let (c, g) = (ctx.clone(), music_gain.clone());
+                wasm_bindgen_futures::spawn_local(async move {
+                    match wasm_bindgen_futures::JsFuture::from(p).await {
+                        Ok(b) => {
+                            if let Ok(src) = c.create_buffer_source() {
+                                src.set_buffer(Some(b.unchecked_ref()));
+                                src.set_loop(true);
+                                let _ = src.connect_with_audio_node(&g);
+                                let _ = src.start();
+                            }
+                        }
+                        Err(e) => log::warn!("the menu music would not decode: {e:?}"),
+                    }
+                });
+            }
+            Some(Self { ctx, music_gain, level: Cell::new(0.0), _proc: proc })
+        }
+
+        pub fn wake(&self) {
+            if self.ctx.state() == web_sys::AudioContextState::Suspended {
+                let _ = self.ctx.resume();
+            }
+        }
+
+        pub fn music(&self, on: bool, dt: f32) {
+            let v = self.level.get();
+            let to = if on { 1.0 } else { 0.0 };
+            if v == to {
+                return;
+            }
+            let v = if on { (v + dt * 0.8).min(1.0) } else { (v - dt * 1.2).max(0.0) };
+            self.level.set(v);
+            self.music_gain.gain().set_value(v * v * 0.7);
+        }
     }
 }

@@ -405,8 +405,8 @@ impl FluidGpu {
     /// `coarse_acc`: the scene's coarse smoke volume accumulator (vol.wgsl).
     pub fn new(d: &wgpu::Device, l0: &wgpu::BindGroupLayout, common: &str, coarse_acc: &wgpu::Buffer) -> Self {
         let prefix = shader_prefix();
-        let m_sim = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("fluid sim"), source: wgpu::ShaderSource::Wgsl(format!("{prefix}\n{}", include_str!("shaders/fluid_sim.wgsl")).into()) });
-        let m_draw = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("fluid draw"), source: wgpu::ShaderSource::Wgsl(format!("{common}\n{prefix}\n{}", include_str!("shaders/fluid_draw.wgsl")).into()) });
+        let m_sim = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("fluid sim"), source: crate::render::wgsl(format!("{prefix}\n{}", include_str!("shaders/fluid_sim.wgsl")).into()) });
+        let m_draw = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("fluid draw"), source: crate::render::wgsl(format!("{common}\n{prefix}\n{}", include_str!("shaders/fluid_draw.wgsl")).into()) });
         let fu_size = std::mem::size_of::<FU>() as u64;
         let ub = d.create_buffer(&wgpu::BufferDescriptor { label: Some("fluid u"), size: fu_size, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let src_buf = d.create_buffer(&wgpu::BufferDescriptor { label: Some("fluid sources"), size: (MAX_SRC * std::mem::size_of::<GpuSrc>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });

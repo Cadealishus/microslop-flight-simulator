@@ -2,3 +2,6 @@
 /fableflight-updated
 *.zip
 career.txt
+/web/pkg
+/browser-edition
+/.claude

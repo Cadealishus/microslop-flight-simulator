@@ -75,15 +75,14 @@ pub fn spawn(fetch: Fetcher) -> Receiver<Layer> {
     let fetch = std::sync::Arc::new(fetch);
     for s in &SPECS {
         let (tx, fetch) = (tx.clone(), fetch.clone());
-        std::thread::spawn(move || {
-            let t0 = std::time::Instant::now();
-            match load(&fetch, s) {
-                Ok(l) => {
-                    log::info!("ground scan {} ready in {:.0} ms", s.id, t0.elapsed().as_secs_f64() * 1000.0);
-                    let _ = tx.send(l);
-                }
-                Err(e) => log::warn!("ground scan {}: {e} (keeping the procedural layer)", s.id),
+        let t0 = crate::plat::Instant::now();
+        // (Low priority: the terrain around the aircraft comes first.)
+        crate::plat::task(1e6, move || load(&fetch, s), move |r| match r {
+            Ok(l) => {
+                log::info!("ground scan {} ready in {:.0} ms", s.id, t0.elapsed().as_secs_f64() * 1000.0);
+                let _ = tx.send(l);
             }
+            Err(e) => log::warn!("ground scan {}: {e} (keeping the procedural layer)", s.id),
         });
     }
     rx

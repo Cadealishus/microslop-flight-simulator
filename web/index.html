@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Microslop Flight Simulator</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #06101f; overflow: hidden; font-family: "Segoe UI", system-ui, sans-serif; }
+  #game { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; outline: none; }
+  #loading {
+    position: fixed; inset: 0; z-index: 10;
+    background: center / cover no-repeat, linear-gradient(160deg, #1a6fd1 0%, #0b2a5c 55%, #06101f 100%);
+    transition: opacity .8s ease;
+  }
+  #loading.done { opacity: 0; pointer-events: none; }
+  #title { position: absolute; top: 38%; left: 0; right: 0; text-align: center; color: #fff; font: italic 900 64px/1 "Segoe UI", system-ui, sans-serif; text-shadow: 0 4px 24px #0008; }
+  #loading.has-art #title { display: none; }
+  #pct { position: absolute; right: 28px; bottom: 20px; color: #fff; font: italic 800 40px/1 "Segoe UI", system-ui, sans-serif; text-shadow: 0 2px 12px #000a, 0 0 2px #000; font-variant-numeric: tabular-nums; }
+  /* only shown when something went wrong (the game writes its own failures here too) */
+  #status { position: absolute; left: 50%; bottom: 32px; transform: translateX(-50%); max-width: min(560px, calc(100% - 32px)); padding: 12px 16px; border-radius: 10px; background: #06101fdd; color: #e8f0ff; font-size: 15px; }
+  #status:empty { display: none; }
+</style>
+</head>
+<body>
+<canvas id="game" tabindex="0"></canvas>
+<div id="loading">
+  <div id="title">Microslop Flight Simulator</div>
+  <div id="pct">0%</div>
+  <div id="status"></div>
+</div>
+<script type="module">
+  // Where the game's files come from: next to this page, or (when a launcher
+  // such as the JSFiddle one opens this page) the mirrors it lists first.
+  // (A page made by a launcher is a blob: with no folder of its own.)
+  const BASES = [...(window.GAME_BASES || []), ...(location.protocol.startsWith("http") ? [new URL("./", location.href).href] : [])];
+  const status = document.getElementById("status");
+  const pct = document.getElementById("pct");
+  const loading = document.getElementById("loading");
+
+  // A file from the first mirror that has it.
+  async function get(path) {
+    let last;
+    for (const base of BASES) {
+      try {
+        const r = await fetch(new URL(path, base), { mode: "cors" });
+        if (r.ok) return r;
+        last = new Error(`HTTP ${r.status} for ${path}`);
+      } catch (e) { last = e; }
+    }
+    throw last || new Error("could not download " + path);
+  }
+
+  // The artwork, once it is here (until then the gradient and title show).
+  get("loading.jpg").then(r => r.blob()).then(b => {
+    loading.style.backgroundImage = `url("${URL.createObjectURL(b)}"), linear-gradient(160deg, #1a6fd1 0%, #0b2a5c 55%, #06101f 100%)`;
+    loading.classList.add("has-art");
+  }).catch(() => {});
+
+  if (!navigator.gpu) {
+    status.textContent = "This browser has no WebGPU, which the game needs. Try Chrome or Edge.";
+  } else {
+    try {
+      // The game is one large file (the aircraft are built in), kept in
+      // pieces: counted as they come in.
+      // (parts.json fresh every time; the pieces by build number, so they stay
+      // cached between visits but are fetched anew after an update)
+      const info = await (await get("pkg/parts.json?t=" + Date.now())).json();
+      const bytes = new Uint8Array(info.size);
+      let at = 0;
+      for (const name of info.parts) {
+        const reader = (await get(`pkg/${name}?v=${info.v}`)).body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytes.set(value, at);
+          at += value.length;
+          pct.textContent = Math.min(99, Math.floor(100 * at / info.size)) + "%";
+        }
+      }
+      if (at !== info.size) throw new Error(`the game file came in at ${at} bytes, not ${info.size}`);
+      pct.textContent = "100%";
+      // The game's own JavaScript, run from wherever it came from.
+      const js = await (await get(`pkg/fablegame.js?v=${info.v}`)).text();
+      const mod = await import(URL.createObjectURL(new Blob([js], { type: "text/javascript" })));
+      await mod.default({ module_or_path: bytes });
+      document.getElementById("game").focus();
+    } catch (e) {
+      // The game reports its own failures into the status line; this catches the rest.
+      if (!String(e).includes("Using exceptions for control flow")) {
+        console.error(e);
+        status.textContent = "Could not load the game: " + (e.message || e);
+      }
+    }
+  }
+</script>
+</body>
+</html>

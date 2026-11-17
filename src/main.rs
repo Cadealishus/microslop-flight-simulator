@@ -1,3 +1,22 @@
+// The browser build leaves desktop-only code unused.
+#![cfg_attr(target_arch = "wasm32", allow(unused, dead_code))]
+/// Desktop-only network code: in the browser build the expression is left
+/// out and the call fails (the desktop's blocking HTTP client has no browser
+/// version).
+#[cfg(not(target_arch = "wasm32"))]
+macro_rules! native {
+    ($e:expr) => {
+        $e
+    };
+}
+#[cfg(target_arch = "wasm32")]
+macro_rules! native {
+    ($e:expr) => {
+        Err(anyhow::anyhow!("not available in the browser"))
+    };
+}
+
+mod plat;
 mod airframe;
 mod airfield;
 mod airmodels;
@@ -76,7 +95,7 @@ use render::{DrawObj, Frame, Globals, PSim, Renderer};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use crate::plat::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -268,7 +287,7 @@ fn parse_args() -> Args {
         aircraft: None,
         no_hud: false,
     };
-    let v: Vec<String> = std::env::args().skip(1).collect();
+    let v: Vec<String> = crate::plat::args();
     let mut i = 0;
     let num = |v: &Vec<String>, i: usize| v.get(i + 1).and_then(|s| s.parse::<f64>().ok());
     while i < v.len() {
@@ -660,9 +679,8 @@ struct Game {
 }
 
 impl Game {
-    fn new(window: Arc<Window>, args: &Args) -> anyhow::Result<Self> {
-        let r = pollster::block_on(Renderer::new(window.clone(), args.vsync))?;
-        let cache = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".")).join("fablegame");
+    fn new(window: Arc<Window>, args: &Args, r: Renderer) -> anyhow::Result<Self> {
+        let cache = crate::plat::cache_dir().unwrap_or_else(|| PathBuf::from(".")).join("fablegame");
         let mut r = r;
         // Cached scans load offline too; missing ones keep the procedural layer.
         r.load_ground_photos(fetch::Fetcher::new(cache.clone(), args.offline));
@@ -710,10 +728,10 @@ impl Game {
         r.set_inst_meshes(&solids);
         // The clock starts at the real time of day there, unless a time was asked
         // for (or a screenshot or recording wants repeating).
-        let hour = if std::env::args().any(|a| ["--time", "--shot", "--record"].contains(&a.as_str())) {
+        let hour = if crate::plat::args().into_iter().any(|a| ["--time", "--shot", "--record"].contains(&a.as_str())) {
             args.hour
         } else {
-            let s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+            let s = crate::plat::SystemTime::now().duration_since(crate::plat::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
             ((s % 86400.0) / 3600.0 + lon / 15.0).rem_euclid(24.0)
         };
         let mut menu = menu::Menu::new(lat, lon, hour);
@@ -747,7 +765,7 @@ impl Game {
         load_fonts(&egui_ctx);
         menu::apply_theme(&egui_ctx);
         let egui_state = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &window, Some(window.scale_factor() as f32), None, Some(4096));
-        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let secs = crate::plat::SystemTime::now().duration_since(crate::plat::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
         let doy = (secs / 86400.0) % 365.25;
         let cam_pos = plane.pos - plane.forward() * spec.cam_dist;
         // What the anti-aliasing takes to be flying along with the camera:
@@ -764,7 +782,7 @@ impl Game {
             record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: true, volume: 1.0, info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, look_sens: 1.0, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(cockpit::FOV).clamp(30.0, 90.0), head_live: false, live: {
                 // Live by default; not when the weather was asked for by hand, nor for
                 // repeatable screenshots and recordings (unless --live says so).
-                let given = |f: &[&str]| std::env::args().any(|a| f.contains(&a.as_str()));
+                let given = |f: &[&str]| crate::plat::args().into_iter().any(|a| f.contains(&a.as_str()));
                 let fixed = args.offline || given(&["--shot", "--record"]);
                 let force = given(&["--live"]);
                 live::Live::new(force || !(fixed || given(&["--clouds", "--wind", "--storms", "--haze"])), force || !fixed)
@@ -807,7 +825,12 @@ impl Game {
                 // already building in the background: wait for that rather than start over
                 Some(i) => {
                     let (_, rx) = self.building.swap_remove(i);
-                    match rx.recv() {
+                    // (The browser cannot wait on it: built here if not done yet.)
+                    #[cfg(target_arch = "wasm32")]
+                    let got = rx.try_recv().map_err(|_| ());
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let got = rx.recv().map_err(|_| ());
+                    match got {
                         Ok(m) => Loaded::upload(spec, m, &mut self.r),
                         Err(_) => Loaded::build(spec, &mut self.r),
                     }
@@ -854,8 +877,8 @@ impl Game {
             },
             None => {
                 let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    let _ = tx.send(Loaded::make(spec));
+                crate::plat::task(0.0, move || Loaded::make(spec), move |m| {
+                    let _ = tx.send(m);
                 });
                 self.building.push((spec, rx));
             }
@@ -980,8 +1003,8 @@ impl Game {
         self.status_until = self.real + 60.0;
         let (tx, rx) = std::sync::mpsc::channel();
         let src = self.src.clone();
-        std::thread::spawn(move || {
-            let g = airports::geo_for(&src, idx).map_err(|e| log::warn!("airport: {e}")).ok();
+        crate::plat::task(-1.0, move || airports::geo_for(&src, idx), move |g| {
+            let g = g.map_err(|e| log::warn!("airport: {e}")).ok();
             let _ = tx.send((idx, g, runway, approach, keep_local));
         });
         self.airport_rx = Some(rx);
@@ -1563,8 +1586,8 @@ impl Game {
         let (tx, rx) = std::sync::mpsc::channel();
         let src = self.src.clone();
         let name = name.to_string();
-        std::thread::spawn(move || {
-            let _ = tx.send(Some((lat, lon, ground_elev(&src, lat, lon), name)));
+        crate::plat::task(-1.0, move || ground_elev(&src, lat, lon), move |h| {
+            let _ = tx.send(Some((lat, lon, h, name)));
         });
         self.goto_rx = Some(rx);
     }
@@ -1626,9 +1649,8 @@ impl Game {
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let src = self.src.clone();
-        std::thread::spawn(move || {
-            let url = format!("https://nominatim.openstreetmap.org/reverse?format=json&zoom=12&lat={lat:.5}&lon={lon:.5}");
-            let name = src.fetch.get(&url).ok().and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok()).and_then(|j| j["display_name"].as_str().map(String::from));
+        let url = format!("https://nominatim.openstreetmap.org/reverse?format=json&zoom=12&lat={lat:.5}&lon={lon:.5}");
+        crate::plat::task(5.0, move || src.fetch.get(&url).ok().and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok()).and_then(|j| j["display_name"].as_str().map(String::from)), move |name| {
             if let Some(n) = name {
                 let _ = tx.send(n);
             }
@@ -1675,8 +1697,8 @@ impl Game {
         self.menu.starting = true;
         let (tx, rx) = std::sync::mpsc::channel();
         let src = self.src.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send((lat, lon, ground_elev(&src, lat, lon)));
+        crate::plat::task(-1.0, move || ground_elev(&src, lat, lon), move |h| {
+            let _ = tx.send((lat, lon, h));
         });
         self.start_rx = Some(rx);
     }
@@ -2837,7 +2859,7 @@ impl Game {
             self.r.set_weather_map(&map);
         }
         self.r.render(Frame { g, tiles, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.ocean.uniform(), egui: Some(ui), shot, logo: (in_menu && !self.menu.home).then(|| self.window.scale_factor() as f32) });
-        if (had_shots && std::env::args().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
+        if (had_shots && crate::plat::args().into_iter().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
             self.quit = true;
         }
     }
@@ -3005,7 +3027,7 @@ impl Game {
             let cap = Rect::from_min_size(quit.min, vec2(40.0, 28.0));
             p.rect_stroke(cap, 5.0, egui::Stroke::new(1.2, col), egui::StrokeKind::Inside);
             p.text(cap.center(), Align2::CENTER_CENTER, "Esc", FontId::proportional(13.0), col);
-            p.text(cap.right_center() + vec2(10.0, 0.0), Align2::LEFT_CENTER, "Quit to Desktop", FontId::proportional(15.0), col);
+            p.text(cap.right_center() + vec2(10.0, 0.0), Align2::LEFT_CENTER, if cfg!(target_arch = "wasm32") { "Close the tab to quit" } else { "Quit to Desktop" }, FontId::proportional(15.0), col);
             if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 clicked = Some(7);
             }
@@ -3661,8 +3683,8 @@ impl Game {
             self.menu.pick_name = format!("Searching for {q}…");
             let (tx, rx) = std::sync::mpsc::channel();
             let src = self.src.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(geocode(&src.fetch, &q).map(|(la, lo, name)| (la, lo, 0.0, name)));
+            crate::plat::task(-1.0, move || geocode(&src.fetch, &q).map(|(la, lo, name)| (la, lo, 0.0, name)), move |r| {
+                let _ = tx.send(r);
             });
             self.goto_rx = Some(rx);
         }
@@ -3921,7 +3943,7 @@ impl Game {
                         if menu::wide_button(ui, "Back to the globe", Hint::Text("choose a new start"), false, true).clicked() {
                             *act = Some(PauseAct::Globe);
                         }
-                        if menu::wide_button(ui, "Quit to desktop", Hint::None, false, true).clicked() {
+                        if menu::wide_button(ui, if cfg!(target_arch = "wasm32") { "Back to the menu" } else { "Quit to desktop" }, Hint::None, false, true).clicked() {
                             *act = Some(PauseAct::Quit);
                         }
                         ui.add_space(8.0);
@@ -4441,8 +4463,8 @@ impl Game {
             self.status_until = self.real + 30.0;
             let (tx, rx) = std::sync::mpsc::channel();
             let src = self.src.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(geocode(&src.fetch, &q).map(|(la, lo, name)| (la, lo, ground_elev(&src, la, lo), name)));
+            crate::plat::task(-1.0, move || geocode(&src.fetch, &q).map(|(la, lo, name)| (la, lo, ground_elev(&src, la, lo), name)), move |r| {
+                let _ = tx.send(r);
             });
             self.goto_rx = Some(rx);
         }
@@ -4483,6 +4505,42 @@ impl Game {
 struct App {
     args: Args,
     game: Option<Game>,
+    /// the browser: the window, and its GPU device on its way
+    #[cfg(target_arch = "wasm32")]
+    starting: Option<(Arc<Window>, std::rc::Rc<std::cell::RefCell<Option<anyhow::Result<Renderer>>>>)>,
+}
+
+impl App {
+    /// The browser: once the GPU device is ready, the game starts (and the loading picture goes).
+    #[cfg(target_arch = "wasm32")]
+    fn finish_start(&mut self) {
+        let Some((w, cell)) = &self.starting else { return };
+        let Some(r) = cell.borrow_mut().take() else { return };
+        let w = w.clone();
+        self.starting = None;
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => return web_fail(&format!("This browser could not start WebGPU: {e:#}")),
+        };
+        match Game::new(w, &self.args, r) {
+            Ok(g) => {
+                self.game = Some(g);
+                if let Some(e) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("loading")) {
+                    let _ = e.set_attribute("class", "done");
+                }
+            }
+            Err(e) => web_fail(&format!("The game failed to start: {e:#}")),
+        }
+    }
+}
+
+/// Shows why the browser build could not start, over the loading picture.
+#[cfg(target_arch = "wasm32")]
+fn web_fail(msg: &str) {
+    log::error!("{msg}");
+    if let Some(e) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("status")) {
+        e.set_text_content(Some(msg));
+    }
 }
 
 impl ApplicationHandler for App {
@@ -4490,19 +4548,52 @@ impl ApplicationHandler for App {
         if self.game.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title("Microslop Flight Simulator").with_inner_size(winit::dpi::PhysicalSize::new(self.args.size.0, self.args.size.1));
-        let window = Arc::new(el.create_window(attrs).expect("window"));
-        match Game::new(window, &self.args) {
-            Ok(g) => self.game = Some(g),
-            Err(e) => {
-                eprintln!("failed to start: {e:#}");
-                el.exit();
+        #[cfg(target_arch = "wasm32")]
+        {
+            if self.starting.is_some() {
+                return;
+            }
+            use wasm_bindgen::JsCast;
+            use winit::platform::web::WindowAttributesExtWebSys;
+            let canvas = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("game")).and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok());
+            let attrs = Window::default_attributes().with_title("Microslop Flight Simulator").with_canvas(canvas).with_prevent_default(true).with_focusable(true);
+            let window = Arc::new(el.create_window(attrs).expect("window"));
+            let cell = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let (w, c) = (window.clone(), cell.clone());
+            let vsync = self.args.vsync;
+            wasm_bindgen_futures::spawn_local(async move {
+                let r = Renderer::new(w.clone(), vsync).await;
+                *c.borrow_mut() = Some(r);
+                w.request_redraw();
+            });
+            self.starting = Some((window, cell));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let attrs = Window::default_attributes().with_title("Microslop Flight Simulator").with_inner_size(winit::dpi::PhysicalSize::new(self.args.size.0, self.args.size.1));
+            let window = Arc::new(el.create_window(attrs).expect("window"));
+            let started = pollster::block_on(Renderer::new(window.clone(), self.args.vsync)).and_then(|r| Game::new(window, &self.args, r));
+            match started {
+                Ok(g) => self.game = Some(g),
+                Err(e) => {
+                    eprintln!("failed to start: {e:#}");
+                    el.exit();
+                }
             }
         }
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        #[cfg(target_arch = "wasm32")]
+        self.finish_start();
         let Some(g) = self.game.as_mut() else { return };
+        // Browsers keep a page silent until it is clicked or typed into.
+        #[cfg(target_arch = "wasm32")]
+        if matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. }) {
+            if let Some(a) = &g.audio {
+                a.wake();
+            }
+        }
         let consumed = g.egui_state.on_window_event(&g.window, &event).consumed;
         match event {
             WindowEvent::CloseRequested => {
@@ -4511,7 +4602,18 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(s) => g.r.resize(s.width, s.height),
             WindowEvent::RedrawRequested => {
+                // (The browser: map tiles and the like are put together here, between frames.)
+                crate::plat::pump(10.0);
                 g.frame();
+                #[cfg(target_arch = "wasm32")]
+                if g.quit {
+                    // A web page cannot close itself: from a flight, back to the menu instead.
+                    g.quit = false;
+                    if g.mode == Mode::Fly {
+                        g.to_globe();
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
                 if g.quit {
                     g.src.google.save();
                     // Worker threads may be mid-download, so the process just
@@ -4625,6 +4727,13 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _: &ActiveEventLoop) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.finish_start();
+            if let Some((w, _)) = &self.starting {
+                w.request_redraw();
+            }
+        }
         if let Some(g) = &self.game {
             g.window.request_redraw();
         }
@@ -4633,6 +4742,15 @@ impl ApplicationHandler for App {
 
 /// The UI library ships no fonts of its own here, so borrow the system's.
 fn load_fonts(ctx: &egui::Context) {
+    // (The browser has no system fonts to borrow: egui's own.)
+    #[cfg(target_arch = "wasm32")]
+    ctx.set_fonts(egui::FontDefinitions::default());
+    #[cfg(not(target_arch = "wasm32"))]
+    load_system_fonts(ctx);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_system_fonts(ctx: &egui::Context) {
     let find = |kind: &str, fallbacks: &[&str]| -> Option<Vec<u8>> {
         let fc = std::process::Command::new("fc-match").args(["-f", "%{file}", kind]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok());
         fc.iter().map(|s| s.trim().to_string()).chain(fallbacks.iter().map(|s| s.to_string())).filter(|p| p.ends_with(".ttf") || p.ends_with(".otf")).find_map(|p| std::fs::read(p).ok())
@@ -4676,12 +4794,45 @@ fn ortho(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) -> Mat4 {
     Mat4::from_cols_array(&[2.0 / (r - l), 0.0, 0.0, 0.0, 0.0, 2.0 / (t - b), 0.0, 0.0, 0.0, 0.0, -1.0 / (f - n), 0.0, -(r + l) / (r - l), -(t + b) / (t - b), -n / (f - n), 1.0])
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,fablegame=info")).init();
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);
     el.run_app(&mut App { args: parse_args(), game: None })?;
     Ok(())
+}
+
+/// The browser build: logs and panics go to the browser console, and the
+/// event loop runs on the page's own (it returns at once).
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    std::panic::set_hook(Box::new(|p| {
+        console_error_panic_hook::hook(p);
+        web_fail(&format!("The game crashed: {p}"));
+    }));
+    struct Console;
+    impl log::Log for Console {
+        fn enabled(&self, m: &log::Metadata) -> bool {
+            m.level() <= log::Level::Warn || (m.level() <= log::Level::Info && m.target().starts_with("fablegame"))
+        }
+        fn log(&self, r: &log::Record) {
+            if self.enabled(r.metadata()) {
+                let s = wasm_bindgen::JsValue::from_str(&format!("{} {}: {}", r.level(), r.target(), r.args()));
+                match r.level() {
+                    log::Level::Error => web_sys::console::error_1(&s),
+                    log::Level::Warn => web_sys::console::warn_1(&s),
+                    _ => web_sys::console::log_1(&s),
+                }
+            }
+        }
+        fn flush(&self) {}
+    }
+    let _ = log::set_logger(&Console).map(|_| log::set_max_level(log::LevelFilter::Info));
+    use winit::platform::web::EventLoopExtWebSys;
+    let el = EventLoop::new().expect("event loop");
+    el.set_control_flow(ControlFlow::Poll);
+    el.spawn_app(App { args: parse_args(), game: None, starting: None });
 }
 
 

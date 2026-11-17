@@ -179,7 +179,7 @@ pub struct ShoreGpu {
 
 impl ShoreGpu {
     pub fn new(d: &wgpu::Device, q: &wgpu::Queue, mask_fmt: wgpu::TextureFormat) -> Self {
-        let m = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("shore"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/shore.wgsl").into()) });
+        let m = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("shore"), source: crate::render::wgsl(include_str!("shaders/shore.wgsl").into()) });
         let pipe = |e: &str| d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(e), layout: None, module: &m, entry_point: Some(e), compilation_options: Default::default(), cache: None });
         let (p_seed, p_jump, p_resolve, p_mip, p_expose) = (pipe("seed"), pipe("jump"), pipe("resolve"), pipe("mip"), pipe("expose"));
         let tex_n = |label: &str, n: u32, fmt: wgpu::TextureFormat, usage: wgpu::TextureUsages, mips: u32| {

@@ -1908,6 +1908,11 @@ pub fn raster(buf: &mut [u8], w: usize, ext: f32, rings: &[Vec<[f32; 2]>], value
 
 pub fn build(src: &Sources, id: TileId) -> Result<BuildingData> {
     debug_assert_eq!(id.z, DATA_ZOOM);
+    // (The browser: everything below at once.)
+    let near = crate::sources::around(id);
+    if !src.ready(&near, &near, &id.children()) {
+        return Err(anyhow::anyhow!("pending"));
+    }
     let vt = src.vector(id)?;
     let (clat, clon) = id.lat_lon(0.5, 0.5);
     let ext = vt.extent;

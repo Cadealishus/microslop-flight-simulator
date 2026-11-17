@@ -36,7 +36,7 @@ use glam::{DMat4, DVec3, Mat4, Vec3};
 use parking_lot::{Condvar, Mutex};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use crate::plat::Instant;
 
 /// Coarsest node drawn (m of geometric error): coarser ones only lead on to
 /// their children. Tiles this coarse are drawn some 7-14 km out.

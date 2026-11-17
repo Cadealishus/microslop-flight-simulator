@@ -849,7 +849,7 @@ pub const WX_H: u32 = 1024;
 pub(crate) fn tex_entry(binding: u32, dim: wgpu::TextureViewDimension, depth: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
-        visibility: wgpu::ShaderStages::all(),
+        visibility: (wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE),
         ty: wgpu::BindingType::Texture {
             sample_type: if depth { wgpu::TextureSampleType::Depth } else { wgpu::TextureSampleType::Float { filterable: true } },
             view_dimension: dim,
@@ -861,13 +861,13 @@ pub(crate) fn tex_entry(binding: u32, dim: wgpu::TextureViewDimension, depth: bo
 pub(crate) fn ub_entry(binding: u32, dynamic: bool, size: u64) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
-        visibility: wgpu::ShaderStages::all(),
+        visibility: (wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE),
         ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: dynamic, min_binding_size: wgpu::BufferSize::new(size) },
         count: None,
     }
 }
 pub(crate) fn samp_entry(binding: u32, ty: wgpu::SamplerBindingType) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::all(), ty: wgpu::BindingType::Sampler(ty), count: None }
+    wgpu::BindGroupLayoutEntry { binding, visibility: (wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE), ty: wgpu::BindingType::Sampler(ty), count: None }
 }
 pub(crate) fn tex_res(binding: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(v) }
@@ -976,7 +976,7 @@ fn plane_textures(device: &wgpu::Device, queue: &wgpu::Queue, tex: &[(&[u8], Opt
     };
     let size = jpeg(tex[0].0).width();
     // Decoded, and their mips made, a layer a thread.
-    let layers: Vec<Vec<(u32, Vec<u8>)>> = std::thread::scope(|s| {
+    let layers: Vec<Vec<(u32, Vec<u8>)>> = crate::plat::scope(|s| {
         let hs: Vec<_> = tex
             .iter()
             .map(|&(rgb, alpha)| {
@@ -1124,7 +1124,7 @@ impl GroundMats {
             })
         };
         let (alb, nrm) = (mk("ground albedo"), mk("ground normal"));
-        let m = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("detail"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/detail.wgsl").into()) });
+        let m = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("detail"), source: crate::render::wgsl(include_str!("shaders/detail.wgsl").into()) });
         let pipe = |entry: &str| d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(entry), layout: None, module: &m, entry_point: Some(entry), compilation_options: Default::default(), cache: None });
         let (p_gen, p_nrm, p_down) = (pipe("gen"), pipe("nrm"), pipe("down"));
         let mut enc = d.create_command_encoder(&Default::default());
@@ -1231,6 +1231,17 @@ fn wave_texture() -> Vec<u8> {
     out
 }
 
+/// WGSL source for a shader module. Browsers' compilers enforce WGSL's
+/// rule that derivatives (and sampling with them) only happen in uniform
+/// control flow; the shaders here rely on them behaving sensibly anyway (as
+/// the desktop compiler allows), so in the browser that check is turned off.
+pub fn wgsl(s: std::borrow::Cow<'_, str>) -> wgpu::ShaderSource<'_> {
+    #[cfg(target_arch = "wasm32")]
+    return wgpu::ShaderSource::Wgsl(format!("diagnostic(off, derivative_uniformity);\n{s}").into());
+    #[cfg(not(target_arch = "wasm32"))]
+    wgpu::ShaderSource::Wgsl(s)
+}
+
 impl Renderer {
     pub async fn new(window: Arc<winit::window::Window>, vsync: bool) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -1242,6 +1253,16 @@ impl Renderer {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor { label: None, required_limits: wgpu::Limits { max_texture_dimension_2d: 8192, max_sampled_textures_per_shader_stage: adapter.limits().max_sampled_textures_per_shader_stage.clamp(16, 32), ..Default::default() }, memory_hints: MEMORY_HINTS, ..Default::default() })
             .await?;
+        // The browser: the first GPU errors explain the rest, so they are logged in full.
+        #[cfg(target_arch = "wasm32")]
+        {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                    log::error!("GPU: {e}");
+                }
+            }));
+        }
         let size = window.inner_size();
         let mut config = surface.get_default_config(&adapter, size.width.max(1), size.height.max(1)).ok_or_else(|| anyhow::anyhow!("surface unsupported"))?;
         let caps = surface.get_capabilities(&adapter);
@@ -1251,7 +1272,7 @@ impl Renderer {
 
         let d = &device;
         let common = include_str!("shaders/common.wgsl");
-        let module = |name: &str, src: &str| d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(format!("{common}\n{src}").into()) });
+        let module = |name: &str, src: &str| d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(name), source: crate::render::wgsl(format!("{common}\n{src}").into()) });
         let m_lut = module("lut", include_str!("shaders/lut.wgsl"));
         let m_terrain = module("terrain", include_str!("shaders/terrain.wgsl"));
         let m_photo = module("photo", include_str!("shaders/photo.wgsl"));
@@ -1272,7 +1293,7 @@ impl Renderer {
         let m_vol = module("vol", include_str!("shaders/vol.wgsl"));
         let m_ao = module("ao", include_str!("shaders/ao.wgsl"));
         let m_taa = module("taa", include_str!("shaders/taa.wgsl"));
-        let m_dres = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("resolve"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/resolve.wgsl").into()) });
+        let m_dres = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("resolve"), source: crate::render::wgsl(include_str!("shaders/resolve.wgsl").into()) });
 
         // ---- shared resources
         let sampler = |addr, aniso: u16, cmp| {
@@ -1365,7 +1386,7 @@ impl Renderer {
         let noise_tex = make_tex(d, "noise3d", 128, 128, 128, 1, wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING);
         let noise = view(&noise_tex);
         {
-            let m = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("noise3d"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/noise3d.wgsl").into()) });
+            let m = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("noise3d"), source: crate::render::wgsl(include_str!("shaders/noise3d.wgsl").into()) });
             let p = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("noise3d"), layout: None, module: &m, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
             let bg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &p.get_bind_group_layout(0), entries: &[tex_res(0, &noise)] });
             let mut enc = d.create_command_encoder(&Default::default());
@@ -1546,7 +1567,7 @@ impl Renderer {
             layout: &l_csmix,
             entries: &[tex_res(0, &cs_all), wgpu::BindGroupEntry { binding: 1, resource: mix_ub.as_entire_binding() }],
         });
-        let m_csmix = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("csmix"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/csmix.wgsl").into()) });
+        let m_csmix = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("csmix"), source: crate::render::wgsl(include_str!("shaders/csmix.wgsl").into()) });
         let pl_csmix = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&l_csmix)], immediate_size: 0 });
         let cshadow = CloudShadow {
             p_in: full("cloud shadow", &pl0, &m_cloud, "fs_cshadow_in", CS_FMT, None),

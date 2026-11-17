@@ -1,4 +1,4 @@
-﻿//! Life at an airport: aircraft at the stands with their ground equipment,
+//! Life at an airport: aircraft at the stands with their ground equipment,
 //! and others pushing back, taxiing out along the real taxiways, holding
 //! short, taking off, and arriving down the approach to land, roll out,
 //! turn off and taxi in to a free stand. The runway in use follows the wind.
@@ -728,7 +728,7 @@ mod tests {
     #[test]
     #[ignore]
     fn traffic_runs() {
-        let cache = dirs::cache_dir().unwrap().join("fablegame");
+        let cache = crate::plat::cache_dir().unwrap().join("fablegame");
         let src = crate::sources::Sources::new(crate::fetch::Fetcher::new(cache, false), String::new());
         for code in std::env::var("AIRPORT").unwrap_or("KSFO".into()).split(',') {
             let idx = crate::airports::Db::get().find(code).unwrap();
@@ -737,7 +737,7 @@ mod tests {
             let (mut deps, mut arrs, mut parked_in) = (0, 0, 0);
             let mut seen_climb = std::collections::HashSet::new();
             let dt = 1.0 / 30.0;
-            let t0 = std::time::Instant::now();
+            let t0 = crate::plat::Instant::now();
             for k in 0..(1200.0 / dt) as usize {
                 let before: Vec<Phase> = t.movers.iter().map(|m| m.phase).collect();
                 let np = t.parked.len();

@@ -16,7 +16,17 @@ use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use crate::plat::{SystemTime, UNIX_EPOCH};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+type Reply = ureq::http::Response<ureq::Body>;
+#[cfg(not(target_arch = "wasm32"))]
+type NetErr = ureq::Error;
+#[cfg(target_arch = "wasm32")]
+type Reply = ();
+#[cfg(target_arch = "wasm32")]
+type NetErr = anyhow::Error;
 
 const API: &str = "https://tile.googleapis.com";
 
@@ -99,6 +109,7 @@ pub struct Google {
     /// where 3D tiles are kept until their max-age runs out (None: not at all)
     cache3d: Option<PathBuf>,
     unsaved: AtomicU32,
+    #[cfg(not(target_arch = "wasm32"))]
     agent: ureq::Agent,
 }
 
@@ -136,6 +147,7 @@ impl Google {
     }
 
     fn with(path: Option<PathBuf>, key: String, enabled: bool, photoreal: bool, usage: Usage) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
         let agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(20))).user_agent("fablegame-flightsim/0.1").http_status_as_error(false).build().into();
         Self {
             enabled: AtomicBool::new(enabled && !key.is_empty()),
@@ -152,6 +164,7 @@ impl Google {
             path,
             cache3d: None,
             unsaved: AtomicU32::new(0),
+            #[cfg(not(target_arch = "wasm32"))]
             agent,
         }
     }
@@ -159,7 +172,7 @@ impl Google {
     /// The saved settings and counts. `key` (from the command line or the
     /// environment) replaces the saved key when given.
     pub fn load(key: Option<String>) -> Self {
-        let path = dirs::config_dir().map(|d| d.join("fablegame").join("google_maps.json"));
+        let path = crate::plat::config_dir().map(|d| d.join("fablegame").join("google_maps.json"));
         let j: serde_json::Value = path.as_ref().and_then(|p| std::fs::read(p).ok()).and_then(|d| serde_json::from_slice(&d).ok()).unwrap_or_default();
         let n = |k: &str| j[k].as_u64().unwrap_or(0);
         let mut u = Usage { month: j["month"].as_str().unwrap_or("").to_string(), month_requests: n("month_requests"), month_bytes: n("month_bytes"), total_requests: n("total_requests"), total_bytes: n("total_bytes"), month_roots: n("month_roots"), total_roots: n("total_roots"), ..Default::default() };
@@ -173,7 +186,7 @@ impl Google {
             g.detail = AtomicU8::new(d as u8);
         }
         if std::env::var_os("FABLE_NO_3D_CACHE").is_none() {
-            g.cache3d = dirs::cache_dir().map(|d| d.join("fablegame").join("g3d"));
+            g.cache3d = crate::plat::cache_dir().map(|d| d.join("fablegame").join("g3d"));
             if let Some(dir) = g.cache3d.clone() {
                 std::thread::spawn(move || prune_cache3d(&dir, now_s(), CACHE3D_MAX));
             }
@@ -234,7 +247,8 @@ impl Google {
     }
 
     pub fn has_key(&self) -> bool {
-        !self.key.lock().is_empty()
+        // (No Google in the browser: its blocking client has no browser version.)
+        cfg!(not(target_arch = "wasm32")) && !self.key.lock().is_empty()
     }
 
     pub fn key(&self) -> String {
@@ -302,25 +316,33 @@ impl Google {
     }
 
     /// One counted call to the API. Errors carry Google's own message.
-    fn call(&self, send: impl FnOnce() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<(u16, Vec<u8>)> {
+    fn call(&self, send: impl FnOnce() -> Result<Reply, NetErr>) -> Result<(u16, Vec<u8>)> {
         self.call_aged(send).map(|(c, d, _)| (c, d))
     }
 
     /// `call`, plus the reply's `Cache-Control: max-age` in seconds (0 when it
     /// has none, or says no-store / no-cache / private).
-    fn call_aged(&self, send: impl FnOnce() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<(u16, Vec<u8>, u64)> {
-        let mut res = match send() {
-            Ok(r) => r,
-            Err(e) => {
-                self.count(0, false);
-                return Err(e.into());
-            }
-        };
-        let code = res.status().as_u16();
-        let age = res.headers().get("cache-control").and_then(|v| v.to_str().ok()).map_or(0, max_age);
-        let data = res.body_mut().with_config().limit(16 << 20).read_to_vec().unwrap_or_default();
-        self.count(data.len(), code == 200);
-        Ok((code, data, age))
+    fn call_aged(&self, send: impl FnOnce() -> Result<Reply, NetErr>) -> Result<(u16, Vec<u8>, u64)> {
+        #[cfg(target_arch = "wasm32")]
+        return send().map(|_| (0, Vec::new(), 0)).map_err(|e| {
+            self.count(0, false);
+            e
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut res = match send() {
+                Ok(r) => r,
+                Err(e) => {
+                    self.count(0, false);
+                    return Err(e.into());
+                }
+            };
+            let code = res.status().as_u16();
+            let age = res.headers().get("cache-control").and_then(|v| v.to_str().ok()).map_or(0, max_age);
+            let data = res.body_mut().with_config().limit(16 << 20).read_to_vec().unwrap_or_default();
+            self.count(data.len(), code == 200);
+            Ok((code, data, age))
+        }
     }
 
     fn fail(&self, code: u16, data: &[u8]) -> anyhow::Error {
@@ -344,7 +366,7 @@ impl Google {
         }
         let key = self.key();
         let body = serde_json::to_vec(&serde_json::json!({ "mapType": "satellite", "language": "en-US", "region": "US" }))?;
-        let (code, data) = self.call(|| self.agent.post(format!("{API}/v1/createSession")).query("key", &key).header("Content-Type", "application/json").send(&body[..]))?;
+        let (code, data) = self.call(|| native!(self.agent.post(format!("{API}/v1/createSession")).query("key", &key).header("Content-Type", "application/json").send(&body[..])))?;
         if code != 200 {
             // Bad key or the API not enabled: no point asking again for every tile.
             if code == 400 || code == 403 {
@@ -376,7 +398,7 @@ impl Google {
         let mut retried = false;
         loop {
             let token = self.token()?;
-            let (code, data) = self.call(|| self.agent.get(format!("{API}/v1/2dtiles/{z}/{x}/{y}")).query("session", &token).query("key", self.key()).call())?;
+            let (code, data) = self.call(|| native!(self.agent.get(format!("{API}/v1/2dtiles/{z}/{x}/{y}")).query("session", &token).query("key", self.key()).call()))?;
             match code {
                 200 if !data.is_empty() => {
                     if let Some(dir) = path.parent() {
@@ -418,7 +440,7 @@ impl Google {
             return Ok(d);
         }
         let url = format!("{API}{path}");
-        let (code, data, age) = self.call_aged(|| self.agent.get(&url).query("key", self.key()).call())?;
+        let (code, data, age) = self.call_aged(|| native!(self.agent.get(&url).query("key", self.key()).call()))?;
         if let (Some(f), true) = (&file, code == 200 && !data.is_empty() && age > 0) {
             write_cache3d(f, now + age, &data);
         }
@@ -467,7 +489,7 @@ impl Google {
         std::thread::spawn(move || {
             let r = (|| -> Result<String> {
                 let token = g.token()?;
-                let (code, data) = g.call(|| {
+                let (code, data) = g.call(|| native!({
                     g.agent
                     .get(format!("{API}/tile/v1/viewport"))
                     .query("session", &token)
@@ -478,7 +500,7 @@ impl Google {
                     .query("east", format!("{:.5}", (lon + span).min(180.0)))
                         .query("west", format!("{:.5}", (lon - span).max(-180.0)))
                         .call()
-                })?;
+                }))?;
                 if code != 200 {
                     return Err(g.fail(code, &data));
                 }

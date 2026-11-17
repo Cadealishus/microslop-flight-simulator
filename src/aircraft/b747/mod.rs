@@ -1641,7 +1641,7 @@ mod tests {
 
     #[test]
     fn model_builds_whole() {
-        let t0 = std::time::Instant::now();
+        let t0 = crate::plat::Instant::now();
         let m = build();
         let nv: usize = m.pieces.iter().map(|p| p.mesh.v.len()).sum();
         let (c, h) = m.bounds();

@@ -121,7 +121,7 @@ impl Impostors {
         let p_bake = pipe("impostor bake", &g_bake, m_tree, "vs_bake", "fs_bake", &vb_tree, &bake_targets, true, MSAA);
         let p_bake_card = pipe("impostor bake cards", &g_bake, m_tree, "vs_bake_card", "fs_bake_card", &vb_tree, &bake_targets, true, MSAA);
         let p_draw = pipe("impostors", &[Some(l0), Some(l_tileu), Some(&l_imp)], m_tree, "vs_imp", "fs_imp", &vb_inst, &draw_targets, true, MSAA);
-        let m_mip = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("impostor mips"), source: wgpu::ShaderSource::Wgsl(MIP_WGSL.into()) });
+        let m_mip = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("impostor mips"), source: crate::render::wgsl(MIP_WGSL.into()) });
         let d2 = wgpu::TextureViewDimension::D2;
         let l_mip = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("impostor mips"), entries: &[tex_entry(0, d2, false), tex_entry(1, d2, false)] });
         let p_mip = pipe("impostor mips", &[Some(&l_mip)], &m_mip, "vs", "fs", &[], &bake_targets, false, 1);

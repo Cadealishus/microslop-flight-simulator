@@ -59,7 +59,7 @@ pub fn grade(fpm: f64) -> &'static str {
 impl Career {
     pub fn load() -> Self {
         let mut c = Self::default();
-        for l in std::fs::read_to_string(FILE).unwrap_or_default().lines() {
+        for l in crate::plat::load_text(FILE).unwrap_or_default().lines() {
             let Some((k, v)) = l.split_once(' ') else { continue };
             let n = v.parse::<f64>().unwrap_or(0.0);
             match k {
@@ -88,7 +88,7 @@ impl Career {
         for (c, b) in CHALLENGES.iter().zip(self.best) {
             s += &format!("{} {b}\n", c.0);
         }
-        if let Err(e) = std::fs::write(FILE, s) {
+        if let Err(e) = crate::plat::save_text(FILE, &s) {
             log::warn!("could not save {FILE}: {e}");
         }
     }

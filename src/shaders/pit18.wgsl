@@ -139,7 +139,7 @@ fn ampcd(p: vec2f, aa: f32) -> vec3f {
   let ang = atan2(q.x, q.y) + rad(hdg);
   let deg = ang * 57.29578;
   let d5 = abs(deg / 5.0 - round(deg / 5.0)) * 5.0;
-  let len = select(0.03, 0.055, abs(deg / 10.0 - round(deg / 10.0)) < 0.01 || d5 < 0.01 && abs(fract(deg / 10.0 + 0.5) - 0.5) < 0.01);
+  let len = select(0.03, 0.055, abs(deg / 10.0 - round(deg / 10.0)) < 0.01 || (d5 < 0.01 && abs(fract(deg / 10.0 + 0.5) - 0.5) < 0.01));
   var ink = aa_line(d5 * 0.0174533 * r, 0.004, aa) * step(0.60 - len, r) * step(r, 0.60);
   ink = max(ink, aa_line(r - 0.60, 0.003, aa));
   for (var i = 0; i < 12; i++) {

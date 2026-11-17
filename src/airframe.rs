@@ -1045,7 +1045,7 @@ pub fn bake_ao(pieces: &mut [Piece], cfg: &AoBake) {
         }
         let verts = &mut p.mesh.v;
         let chunk = verts.len().div_ceil(threads).max(64);
-        std::thread::scope(|s| {
+        crate::plat::scope(|s| {
             for part in verts.chunks_mut(chunk) {
                 let ao_of = &ao_of;
                 s.spawn(move || {
@@ -1072,7 +1072,7 @@ fn smooth_ao(verts: &mut [PartVertex], r: f32, threads: usize) {
     let out: Vec<f32> = {
         let chunk = src.len().div_ceil(threads).max(256);
         let cells = &cells;
-        std::thread::scope(|s| {
+        crate::plat::scope(|s| {
             let hs: Vec<_> = (0..src.len())
                 .step_by(chunk)
                 .map(|a| {

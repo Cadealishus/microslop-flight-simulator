@@ -13,7 +13,8 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use crate::plat::Instant;
+use std::time::Duration;
 
 /// What a station reports.
 #[derive(Clone, Debug)]
@@ -82,15 +83,32 @@ pub struct Live {
     pub traffic: bool,
     /// the station whose weather is in use
     pub station: String,
+    #[allow(dead_code)]
+    polls: Polls,
+}
+
+/// The browser's downloads of the feeds: when each last went out (seconds),
+/// and the one on its way.
+#[derive(Default)]
+#[allow(dead_code)]
+struct Polls {
+    clouds_next: f64,
+    wx_at: Option<(f64, (f64, f64))>,
+    wx_url: Option<String>,
+    ac_at: Option<f64>,
+    ac_url: Option<String>,
+    ac_alt: bool,
 }
 
 fn num(v: &Value) -> Option<f64> {
     v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim_end_matches('+').parse().ok()))
 }
 
-fn metar(agent: &ureq::Agent, lat: f64, lon: f64) -> Option<Metar> {
-    let url = format!("https://aviationweather.gov/api/data/metar?bbox={:.2},{:.2},{:.2},{:.2}&format=json", lat - 0.7, lon - 0.9, lat + 0.7, lon + 0.9);
-    let body = agent.get(&url).call().ok()?.body_mut().read_to_vec().ok()?;
+fn metar_url(lat: f64, lon: f64) -> String {
+    format!("https://aviationweather.gov/api/data/metar?bbox={:.2},{:.2},{:.2},{:.2}&format=json", lat - 0.7, lon - 0.9, lat + 0.7, lon + 0.9)
+}
+
+fn metar(body: &[u8], lat: f64, lon: f64) -> Option<Metar> {
     let v: Value = serde_json::from_slice(&body).ok()?;
     let near = |m: &&Value| {
         let (a, o) = (num(&m["lat"]).unwrap_or(99.0) - lat, (num(&m["lon"]).unwrap_or(999.0) - lon) * lat.to_radians().cos());
@@ -144,10 +162,19 @@ fn model(t: &str, cat: &str) -> u8 {
     }
 }
 
-fn reports(agent: &ureq::Agent, lat: f64, lon: f64) -> Option<Vec<Report>> {
-    // adsb.fi first, adsb.lol should it not answer: the same reports from both
-    let urls = [format!("https://opendata.adsb.fi/api/v2/lat/{lat:.3}/lon/{lon:.3}/dist/45"), format!("https://api.adsb.lol/v2/point/{lat:.3}/{lon:.3}/45")];
-    let v: Value = urls.iter().find_map(|u| serde_json::from_slice(&agent.get(u).call().ok()?.body_mut().read_to_vec().ok()?).ok())?;
+/// adsb.fi first, adsb.lol should it not answer: the same reports from both
+fn report_urls(lat: f64, lon: f64) -> [String; 2] {
+    [format!("https://opendata.adsb.fi/api/v2/lat/{lat:.3}/lon/{lon:.3}/dist/45"), format!("https://api.adsb.lol/v2/point/{lat:.3}/{lon:.3}/45")]
+}
+
+const CLOUD_MAP: &str = "https://clouds.matteason.co.uk/images/2048x1024/clouds.jpg";
+
+fn cloud_map(b: &[u8]) -> Option<Vec<u8>> {
+    image::load_from_memory(b).ok().map(|i| i.to_luma8()).filter(|i| i.width() == crate::render::WX_W && i.height() == crate::render::WX_H).map(|m| m.into_raw())
+}
+
+fn reports(body: &[u8]) -> Option<Vec<Report>> {
+    let v: Value = serde_json::from_slice(body).ok()?;
     let mut out = Vec::new();
     for a in v["aircraft"].as_array().or(v["ac"].as_array())? {
         let (Some(lat), Some(lon), Some(hex)) = (a["lat"].as_f64(), a["lon"].as_f64(), a["hex"].as_str()) else { continue };
@@ -180,6 +207,80 @@ impl Live {
     /// Starts the fetching thread. Nothing is fetched while a feed is off.
     pub fn new(weather: bool, traffic: bool) -> Self {
         let shared = Arc::new(Mutex::new(Shared { at: (0.0, 0.0), want: (false, false), metar: None, reports: None, clouds: None }));
+        #[cfg(not(target_arch = "wasm32"))]
+        Self::spawn(&shared, weather);
+        Self { shared, planes: HashMap::new(), weather, traffic, station: String::new(), polls: Polls::default() }
+    }
+
+    /// In the browser there is no thread to wait on downloads: each frame
+    /// looks whether one has come in, and starts the next when it is due.
+    #[cfg(target_arch = "wasm32")]
+    fn poll(&mut self) {
+        use crate::plat::{http_take, now_ms};
+        let now = now_ms() / 1000.0;
+        let (at, want) = {
+            let s = self.shared.lock();
+            (s.at, s.want)
+        };
+        let p = &mut self.polls;
+        if self.weather && now >= p.clouds_next {
+            match http_take(CLOUD_MAP) {
+                Some(Ok(b)) => {
+                    let m = cloud_map(&b);
+                    p.clouds_next = now + if m.is_some() { 3.0 * 3600.0 } else { 300.0 };
+                    if let Some(m) = m {
+                        log::info!("live cloud map of the Earth loaded");
+                        self.shared.lock().clouds = Some(m);
+                    }
+                }
+                Some(Err(_)) => p.clouds_next = now + 300.0,
+                None => {}
+            }
+        }
+        if at == (0.0, 0.0) {
+            return;
+        }
+        let moved = p.wx_at.is_none_or(|(_, q)| (q.0 - at.0).abs() + (q.1 - at.1).abs() > 0.4);
+        if let Some(url) = p.wx_url.clone() {
+            match http_take(&url) {
+                Some(r) => {
+                    p.wx_url = None;
+                    if let Some(m) = r.ok().and_then(|b| metar(&b, at.0, at.1)) {
+                        log::info!("live weather from {}: {:?}", m.station, m);
+                        self.shared.lock().metar = Some(m);
+                    }
+                }
+                None => {}
+            }
+        } else if want.0 && (moved || p.wx_at.is_none_or(|(t, _)| now - t > 600.0)) {
+            p.wx_at = Some((now, at));
+            let u = metar_url(at.0, at.1);
+            let _ = http_take(&u);
+            p.wx_url = Some(u);
+        }
+        if let Some(url) = p.ac_url.clone() {
+            match http_take(&url) {
+                Some(r) => {
+                    p.ac_url = None;
+                    match r.ok().and_then(|b| reports(&b)) {
+                        Some(r) => self.shared.lock().reports = Some(r),
+                        // the other feed next time
+                        None => p.ac_alt = !p.ac_alt,
+                    }
+                }
+                None => {}
+            }
+        } else if want.1 && p.ac_at.is_none_or(|t| now - t > 6.0) {
+            p.ac_at = Some(now);
+            let u = report_urls(at.0, at.1)[p.ac_alt as usize].clone();
+            let _ = http_take(&u);
+            p.ac_url = Some(u);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn(shared: &Arc<Mutex<Shared>>, weather: bool) {
+        let get = |agent: &ureq::Agent, url: &str| -> Option<Vec<u8>> { agent.get(url).call().ok()?.body_mut().read_to_vec().ok() };
         if weather {
             // The whole Earth's cloud cover for the planet in the menus: a
             // satellite composite that is redone every three hours.
@@ -187,11 +288,11 @@ impl Live {
             let _ = std::thread::Builder::new().name("live clouds".into()).spawn(move || {
                 let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(30))).user_agent("fablegame-flightsim/0.1").build().into();
                 loop {
-                    let map = agent.get("https://clouds.matteason.co.uk/images/2048x1024/clouds.jpg").call().ok().and_then(|mut r| r.body_mut().read_to_vec().ok()).and_then(|b| image::load_from_memory(&b).ok()).map(|i| i.to_luma8()).filter(|i| i.width() == crate::render::WX_W && i.height() == crate::render::WX_H);
+                    let map = get(&agent, CLOUD_MAP).and_then(|b| cloud_map(&b));
                     let ok = map.is_some();
                     if let Some(m) = map {
                         log::info!("live cloud map of the Earth loaded");
-                        sh.lock().clouds = Some(m.into_raw());
+                        sh.lock().clouds = Some(m);
                     }
                     std::thread::sleep(Duration::from_secs(if ok { 3 * 3600 } else { 300 }));
                 }
@@ -215,7 +316,7 @@ impl Live {
                 let moved = wx_at.is_none_or(|(_, p)| (p.0 - at.0).abs() + (p.1 - at.1).abs() > 0.4);
                 if want.0 && (moved || wx_at.is_none_or(|(t, _)| t.elapsed() > Duration::from_secs(600))) {
                     wx_at = Some((Instant::now(), at));
-                    if let Some(m) = metar(&agent, at.0, at.1) {
+                    if let Some(m) = get(&agent, &metar_url(at.0, at.1)).and_then(|b| metar(&b, at.0, at.1)) {
                         log::info!("live weather from {}: {:?}", m.station, m);
                         sh.lock().metar = Some(m);
                     }
@@ -223,7 +324,7 @@ impl Live {
                 if want.1 && ac_at.is_none_or(|t| t.elapsed() > Duration::from_secs(6)) {
                     let first = ac_at.is_none();
                     ac_at = Some(Instant::now());
-                    let got = reports(&agent, at.0, at.1);
+                    let got = report_urls(at.0, at.1).iter().find_map(|u| get(&agent, u).and_then(|b| reports(&b)));
                     if first {
                         log::info!("live traffic: {}", got.as_ref().map_or("no answer".to_string(), |r| format!("{} aircraft reporting within 45 nm", r.len())));
                     }
@@ -233,7 +334,6 @@ impl Live {
                 }
             }
         });
-        Self { shared, planes: HashMap::new(), weather, traffic, station: String::new() }
     }
 
     /// How many real aircraft are around.
@@ -244,6 +344,8 @@ impl Live {
     /// Each frame: takes what has arrived (new weather goes into `wx`) and
     /// carries the aircraft on. `ground` is the height of the ground at a lat/lon.
     pub fn update(&mut self, dt: f64, player: DVec3, wx: &mut Weather, ground: &dyn Fn(f64, f64) -> Option<f64>) {
+        #[cfg(target_arch = "wasm32")]
+        self.poll();
         let (lat, lon, _) = geo::pos_to_lla(player);
         let (metar, reports) = {
             let mut s = self.shared.lock();

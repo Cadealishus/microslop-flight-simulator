@@ -598,6 +598,10 @@ pub fn build_geo(src: &Sources, idx: u32) -> Result<Geo> {
         }
         x = (x + 1) % size;
     }
+    // (The browser: all the airfield's map tiles at once.)
+    if !src.ready(&tiles, &tiles, &[]) {
+        return Err(anyhow!("pending"));
+    }
     struct Piece {
         pts: Vec<Vec2>,
         name: String,
@@ -1161,6 +1165,10 @@ pub fn geo_for(src: &Sources, idx: u32) -> Result<std::sync::Arc<Geo>> {
         return Ok(g.clone());
     }
     let g = std::sync::Arc::new(build_geo(src, idx)?);
+    // (In the browser: put together while map tiles were still on their way, so not kept.)
+    if crate::plat::pending() {
+        return Ok(g);
+    }
     let mut f = src.fields.lock();
     if f.len() > 24 {
         f.clear();
@@ -1179,11 +1187,11 @@ mod tests {
     #[test]
     #[ignore]
     fn geo_report() {
-        let cache = dirs::cache_dir().unwrap().join("fablegame");
+        let cache = crate::plat::cache_dir().unwrap().join("fablegame");
         let src = Sources::new(crate::fetch::Fetcher::new(cache, false), String::new());
         for code in std::env::var("AIRPORT").unwrap_or("KSFO".into()).split(',') {
             let idx = Db::get().find(code).expect("unknown airport");
-            let t0 = std::time::Instant::now();
+            let t0 = crate::plat::Instant::now();
             let g = build_geo(&src, idx).unwrap();
             let a = g.apt();
             println!("{} {} kind {} elev {:.0} m: {} runways, {} taxiways, {} aprons, {} gates, {} nodes, {} edges, {} stands, {} holds, {:.0} ms", a.ident, a.name, a.kind, g.elev, g.runways.len(), g.taxiways.len(), g.aprons.len(), g.gates.len(), g.graph.nodes.len(), g.graph.edges.len(), g.stands.len(), g.holds.len(), t0.elapsed().as_secs_f64() * 1000.0);
@@ -1279,7 +1287,7 @@ mod seam_tests {
     #[test]
     #[ignore]
     fn level_seams() {
-        let cache = dirs::cache_dir().unwrap().join("fablegame");
+        let cache = crate::plat::cache_dir().unwrap().join("fablegame");
         let src = Sources::new(crate::fetch::Fetcher::new(cache, false), String::new());
         let code = std::env::var("AIRPORT").unwrap_or("LFLJ".into());
         let a = &Db::get().apts[Db::get().find(&code).unwrap() as usize];

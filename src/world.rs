@@ -197,7 +197,7 @@ pub struct World {
     pub tree_dims: Vec<TreeDim>,
     tick: u32,
     pub stats: (usize, usize, usize), // drawn tiles, loading, building tiles
-    last_update: Option<std::time::Instant>,
+    last_update: Option<crate::plat::Instant>,
     uploads: VecDeque<Upload>,
     fields: HashMap<u32, FSlot>,
     /// photorealistic 3D tiles near the aircraft (taken out while it updates)
@@ -815,7 +815,7 @@ impl World {
 
     pub fn update(&mut self, r: &Renderer, cam: DVec3, fr: &Frustum) {
         self.frame += 1;
-        let now = std::time::Instant::now();
+        let now = crate::plat::Instant::now();
         let real_dt = self.last_update.map(|t| (now - t).as_secs_f32().min(0.25)).unwrap_or(0.0);
         self.last_update = Some(now);
         // Take finished tiles off the worker pool, capping the GPU uploads per

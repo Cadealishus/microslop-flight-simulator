@@ -600,7 +600,7 @@ pub const OCEAN_G: usize = 3 + 3 * MIPS as usize;
 
 impl OceanGpu {
     pub fn new(d: &wgpu::Device, q: &wgpu::Queue) -> Self {
-        let m = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("ocean"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/ocean.wgsl").into()) });
+        let m = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("ocean"), source: crate::render::wgsl(include_str!("shaders/ocean.wgsl").into()) });
         let pipe = |e: &str| d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(e), layout: None, module: &m, entry_point: Some(e), compilation_options: Default::default(), cache: None });
         let (p_rows, p_cols, p_mip) = (pipe("rows"), pipe("cols"), pipe("mip"));
         let (p_foam, p_ctl) = (pipe("foam"), pipe("foam_ctl"));
@@ -718,7 +718,7 @@ mod tests {
         for wind in [2.0, 7.0, 14.0] {
             let mut o = Ocean::new();
             o.update(0.0, 10.0, wind, 270.0, 0.6, DVec3::ZERO, DVec3::X, DVec3::Y, DVec2::ZERO);
-            let t0 = std::time::Instant::now();
+            let t0 = crate::plat::Instant::now();
             o.lost_slopes();
             let dt = t0.elapsed();
             let mut total = (o.ripple[0] + o.ripple[1]) as f64;

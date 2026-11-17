@@ -221,6 +221,46 @@ impl Sources {
         Ok(image::load_from_memory(&data)?.to_rgba8())
     }
 
+    /// The browser: asks for the downloads behind these tiles (elevation,
+    /// map data, imagery) all at once, where the code that uses them would
+    /// find each missing, and wait for it, one after another. True when they
+    /// are all in (or failed for good). The desktop's downloads block on
+    /// their own threads, so there it does nothing.
+    pub fn ready(&self, elev: &[TileId], vec: &[TileId], img: &[TileId]) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (elev, vec, img);
+            true
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let missing = |r: Result<Vec<u8>>| r.is_err_and(|e| e.to_string() == "pending");
+            let tpl = |s: &str, id: &TileId| s.replace("{z}", &id.z.to_string()).replace("{x}", &id.x.to_string()).replace("{y}", &id.y.to_string());
+            let mut ok = true;
+            for id in elev {
+                if self.raw.lock().get(*id).is_none() {
+                    ok &= !missing(self.fetch.get_cached(&format!("elev/{}/{}/{}.png", id.z, id.x, id.y), &tpl("https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png", id)));
+                }
+            }
+            if !vec.is_empty() {
+                match self.vec_template() {
+                    Ok(t) => {
+                        for id in vec {
+                            if self.vec.lock().get(*id).is_none() {
+                                ok &= !missing(self.fetch.get_cached(&format!("vec/{}/{}/{}.pbf", id.z, id.x, id.y), &tpl(&t, id)));
+                            }
+                        }
+                    }
+                    Err(_) => ok &= !crate::plat::pending(),
+                }
+            }
+            for id in img {
+                ok &= !missing(self.fetch.get_cached(&format!("img/{}/{}/{}.jpg", id.z, id.x, id.y), &tpl(&self.imagery_url, id)));
+            }
+            ok
+        }
+    }
+
     /// Elevation as the data has it.
     pub fn elev_raw(&self, id: TileId) -> Result<Arc<ElevTile>> {
         if let Some(t) = self.raw.lock().get(id) {
@@ -461,6 +501,10 @@ impl Sources {
         if let Some(t) = self.elev.lock().get(id) {
             return Ok(t);
         }
+        let near = around(id);
+        if !self.ready(&near, if id.z == DATA_ZOOM { &near } else { &[] }, &[]) {
+            return Err(anyhow!("pending"));
+        }
         let raw = self.elev_raw(id)?;
         // Levelling reaches a little past the pavement, so a tile is levelled
         // when its neighbours have airfield pavement too (or there would be a
@@ -473,7 +517,10 @@ impl Sources {
             }))
         };
         let t = Arc::new(if aero { self.level_airfield(id, &raw) } else { self.padded(id, &raw) });
-        self.elev.lock().put(id, t.clone());
+        // (In the browser: made while neighbouring tiles were still on their way, so not kept.)
+        if !crate::plat::pending() {
+            self.elev.lock().put(id, t.clone());
+        }
         Ok(t)
     }
 
@@ -919,16 +966,25 @@ fn ground_mask(vt: &VecTile, ox: f64, oy: f64, scale: f64, tile_m: f64) -> Vec<u
     out
 }
 
+/// A tile and the eight around it.
+pub fn around(id: TileId) -> Vec<TileId> {
+    let size = 1i64 << id.z;
+    let mut out = Vec::with_capacity(9);
+    for dy in -1..=1i64 {
+        for dx in -1..=1i64 {
+            let (x, y) = ((id.x as i64 + dx).rem_euclid(size), id.y as i64 + dy);
+            if (0..size).contains(&y) {
+                out.push(TileId::new(id.z, x as u32, y as u32));
+            }
+        }
+    }
+    out
+}
+
 pub fn build_tile(src: &Sources, id: TileId) -> Result<TileData> {
     // read before the image, so a switch while this tile loads still refreshes it
     let imagery_gen = src.google.generation();
-    let img = src.imagery(id)?;
-    let img_size = img.width();
-    if img_size != img.height() || !img_size.is_power_of_two() {
-        return Err(anyhow!("unexpected imagery size"));
-    }
     let (did, ox, oy, sc) = id.ancestor(DATA_ZOOM);
-    let elev = src.elev(did).ok();
     // Coarser tiles near an airfield take their heights from the finer,
     // levelled data too, or the two would not meet where they join.
     let (clat0, clon0) = id.lat_lon(0.5, 0.5);
@@ -936,6 +992,27 @@ pub fn build_tile(src: &Sources, id: TileId) -> Result<TileData> {
         let db = crate::airports::Db::get();
         db.near(clat0.to_degrees(), clon0.to_degrees(), id.width_m() * 0.75 + 5000.0).iter().any(|(i, _)| db.apts[*i as usize].any_paved())
     };
+    // (The browser: everything below at once.)
+    let mut near = around(did);
+    if fine_elev {
+        let k = DATA_ZOOM - id.z;
+        for y in id.y << k..(id.y + 1) << k {
+            for x in id.x << k..(id.x + 1) << k {
+                near.extend(around(TileId::new(DATA_ZOOM, x, y)));
+            }
+        }
+        near.sort_by_key(|t| (t.x, t.y));
+        near.dedup();
+    }
+    if !src.ready(&near, &near, &[id]) {
+        return Err(anyhow!("pending"));
+    }
+    let img = src.imagery(id)?;
+    let img_size = img.width();
+    if img_size != img.height() || !img_size.is_power_of_two() {
+        return Err(anyhow!("unexpected imagery size"));
+    }
+    let elev = src.elev(did).ok();
     let mut fine_cache: HashMap<TileId, Option<Arc<ElevTile>>> = HashMap::new();
     let mut height_at = |u: f64, v: f64| -> f32 {
         if fine_elev {
@@ -1110,11 +1187,41 @@ pub enum JobResult {
 }
 
 pub struct Loader {
+    #[cfg(not(target_arch = "wasm32"))]
     queue: Arc<(Mutex<Vec<(f32, Job)>>, Condvar)>,
+    #[cfg(target_arch = "wasm32")]
+    tx: crossbeam_channel::Sender<JobResult>,
     pub rx: crossbeam_channel::Receiver<JobResult>,
     pub src: Arc<Sources>,
 }
 
+fn run_job(src: &Sources, job: &Job) -> JobResult {
+    match *job {
+        Job::Terrain(id) => JobResult::Terrain(id, build_tile(src, id)),
+        Job::Buildings(id) => JobResult::Buildings(id, crate::buildings::build(src, id)),
+        Job::Airfield(i) => JobResult::Airfield(i, crate::airports::geo_for(src, i).map(|g| {
+            let m = crate::airfield::build(&g);
+            (g, m)
+        })),
+    }
+}
+
+/// In the browser: each job is a task of its own, run between frames (see plat).
+#[cfg(target_arch = "wasm32")]
+impl Loader {
+    pub fn new(src: Arc<Sources>, _threads: usize) -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        Self { tx, rx, src }
+    }
+    pub fn submit(&self, prio: f32, job: Job) {
+        let (src, tx) = (self.src.clone(), self.tx.clone());
+        crate::plat::task(prio, move || run_job(&src, &job), move |r| {
+            let _ = tx.send(r);
+        });
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl Loader {
     pub fn new(src: Arc<Sources>, threads: usize) -> Self {
         let queue = Arc::new((Mutex::new(Vec::<(f32, Job)>::new()), Condvar::new()));
@@ -1130,14 +1237,7 @@ impl Loader {
                     let best = q.iter().enumerate().min_by(|a, b| a.1 .0.total_cmp(&b.1 .0)).map(|(i, _)| i).unwrap();
                     q.swap_remove(best).1
                 };
-                let res = match job {
-                    Job::Terrain(id) => JobResult::Terrain(id, build_tile(&src, id)),
-                    Job::Buildings(id) => JobResult::Buildings(id, crate::buildings::build(&src, id)),
-                    Job::Airfield(i) => JobResult::Airfield(i, crate::airports::geo_for(&src, i).map(|g| {
-                        let m = crate::airfield::build(&g);
-                        (g, m)
-                    })),
-                };
+                let res = run_job(&src, &job);
                 if tx.send(res).is_err() {
                     break;
                 }

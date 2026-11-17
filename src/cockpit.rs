@@ -164,7 +164,7 @@ fn table(spec: &'static Spec) -> &'static [f32] {
     static T: [std::sync::OnceLock<Vec<f32>>; 9] = [const { std::sync::OnceLock::new() }; 9];
     T[spec.id as usize].get_or_init(|| {
         let mut t = vec![0.0f32; LW * LH];
-        std::thread::scope(|s| {
+        crate::plat::scope(|s| {
             for (j, row) in t.chunks_mut(LW).enumerate() {
                 s.spawn(move || {
                     for (i, c) in row.iter_mut().enumerate() {
