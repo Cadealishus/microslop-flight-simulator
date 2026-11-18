@@ -775,6 +775,8 @@ pub struct Renderer {
     bg_obj_more: Vec<(u32, wgpu::BindGroup)>,
     /// the scene's resolution as a fraction of the window's (graphics quality)
     scale: f32,
+    /// what is drawn at all (graphics settings)
+    pub lite: Lite,
     l_obj: wgpu::BindGroupLayout,
     /// the Hornet's paint (bound with every aircraft's textures)
     paint: wgpu::TextureView,
@@ -1246,6 +1248,26 @@ pub fn wgsl(s: std::borrow::Cow<'_, str>) -> wgpu::ShaderSource<'_> {
     return wgpu::ShaderSource::Wgsl(format!("diagnostic(off, derivative_uniformity);\n{s}").into());
     #[cfg(not(target_arch = "wasm32"))]
     wgpu::ShaderSource::Wgsl(s)
+}
+
+/// Parts of the frame that can be left out on slow graphics (the settings'
+/// Potato preset and its switches): each is a whole pass, or a set of draws.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lite {
+    /// the sun's shadow cascades (the aircraft's own small shadow stays)
+    pub shadows: bool,
+    /// ambient occlusion (the soft darkening in corners and under things)
+    pub ao: bool,
+    /// the volumetric cloud layer (the sky and the haze stay)
+    pub clouds: bool,
+    /// trees and undergrowth
+    pub trees: bool,
+}
+
+impl Default for Lite {
+    fn default() -> Self {
+        Lite { shadows: true, ao: true, clouds: true, trees: true }
+    }
 }
 
 /// A size times a scale, at least a pixel.
@@ -1937,7 +1959,7 @@ impl Renderer {
             ground_mats,
             casc_ub, bg_casc, bg_tileu, l_dres, l_ao, p_gtao, p_ao_blur, p_dres, p_road, p_field, p_lights, dyn_lights, p_tree, p_tree_near, imp, p_tree_shadow, p_tree_shadow_fixed, p_card, near_buf, p_inst, p_inst_shadow, inst_buf, fall_buf, tree_lib: None, inst_lib: None,
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, l_tile, l_build, l_composite, l_cloud, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
-            tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, build_ub, obj_ub, bg_obj, bg_obj_more: Vec::new(), scale: 1.0, l_obj, paint, tile_ibuf, tile_nidx: ix.len() as u32,
+            tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, build_ub, obj_ub, bg_obj, bg_obj_more: Vec::new(), scale: 1.0, lite: Lite::default(), l_obj, paint, tile_ibuf, tile_nidx: ix.len() as u32,
             p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, p_glass, p_composite, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
             psim_ub, pbuf, bg_psim, phead: 0, p_vol, bg_vol_a, bg_vol_b, vol_acc, fluid, fluid_t, ocean, shore, p_shore_cover, smoke_until: 0.0, now: 0.0, black, wx_tex, wx_view, targets, cloud_flip: 0, cloud_hist_ok: false, cshadow, lut_bake, lut_haze: 1.0, taa_flip: 0, taa_hist_ok: false, meshes: Vec::new(), egui, logo_font: crate::logo::find_font(), logo_key: None, surface, config, queue, device,
         })
@@ -2473,7 +2495,7 @@ impl Renderer {
                     rp.draw_indexed(r.0..r.1, 0, r.2..r.2 + 1);
                 }
             }
-            if let Some(lib) = &self.tree_lib {
+            if let Some(lib) = self.tree_lib.as_ref().filter(|_| self.lite.trees) {
                 rp.set_vertex_buffer(0, lib.vbuf.slice(..));
                 rp.set_index_buffer(lib.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 // In view only the trees short of IMP_DIST are models (impostors follow below).
@@ -2683,7 +2705,7 @@ impl Renderer {
         }
         for c in 0..CASCADES {
             let mut rp = enc.begin_render_pass(&pass_desc(&[], Some(depth_att(&self.shadow[c], 1.0))));
-            if f.g.csm[3] > 0.0 {
+            if f.g.csm[3] > 0.0 && self.lite.shadows {
                 rp.set_bind_group(0, &self.bg0_shadow, &[]);
                 rp.set_bind_group(2, &self.bg_casc, &[c as u32 * 256]);
                 solids(&mut rp, Some(c));
@@ -2845,8 +2867,14 @@ impl Renderer {
             rp.set_bind_group(1, bg1, &[]);
             rp.draw(0..3, 0..1);
         };
-        full(&mut enc, &t.ao_raw, true, &self.p_gtao, &t.bg_gtao);
-        full(&mut enc, &t.ao, true, &self.p_ao_blur, &t.bg_ao_blur);
+        if self.lite.ao {
+            full(&mut enc, &t.ao_raw, true, &self.p_gtao, &t.bg_gtao);
+            full(&mut enc, &t.ao, true, &self.p_ao_blur, &t.bg_ao_blur);
+        } else {
+            // No occlusion anywhere: fully lit (composite.wgsl reads 1 as open).
+            let white = wgpu::RenderPassColorAttachment { view: &t.ao, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store } };
+            drop(enc.begin_render_pass(&pass_desc(&[Some(white)], None)));
+        }
         full(&mut enc, &t.hdr, true, &self.p_composite, &t.bg_composite);
         // Lights over the lit scene, under the clouds.
         if n_fields > 0 || n_dyn > 0 {
@@ -2867,21 +2895,26 @@ impl Renderer {
                 rp.draw(0..6, 0..n_dyn as u32);
             }
         }
-        {
-            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.cloud, true)), Some(color_att(&t.cloud_dist, true))], None));
-            rp.set_pipeline(&self.p_cloud);
-            rp.set_bind_group(0, &self.bg0, &[]);
-            rp.set_bind_group(1, &t.bg_cloud, &[]);
-            rp.draw(0..3, 0..1);
-        }
-        let cf = self.cloud_flip;
-        full(&mut enc, &t.cloud_hist[cf], true, &self.p_cloud_temporal, &t.bg_cloud_temporal[cf]);
-        {
-            let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.hdr, false))], None));
-            rp.set_bind_group(0, &self.bg0, &[]);
-            rp.set_pipeline(&self.p_cloud_apply);
-            rp.set_bind_group(1, &t.bg_cloud_apply[cf], &[]);
-            rp.draw(0..3, 0..1);
+        if self.lite.clouds {
+            {
+                let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.cloud, true)), Some(color_att(&t.cloud_dist, true))], None));
+                rp.set_pipeline(&self.p_cloud);
+                rp.set_bind_group(0, &self.bg0, &[]);
+                rp.set_bind_group(1, &t.bg_cloud, &[]);
+                rp.draw(0..3, 0..1);
+            }
+            let cf = self.cloud_flip;
+            full(&mut enc, &t.cloud_hist[cf], true, &self.p_cloud_temporal, &t.bg_cloud_temporal[cf]);
+            {
+                let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.hdr, false))], None));
+                rp.set_bind_group(0, &self.bg0, &[]);
+                rp.set_pipeline(&self.p_cloud_apply);
+                rp.set_bind_group(1, &t.bg_cloud_apply[cf], &[]);
+                rp.draw(0..3, 0..1);
+            }
+        } else {
+            // (their history is stale when they come back)
+            self.cloud_hist_ok = false;
         }
         {
             let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.hdr, false))], None));

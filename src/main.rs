@@ -697,8 +697,11 @@ struct Game {
     others: std::collections::HashMap<u32, Plane>,
     mp_code: String,
     view: (Mat4, DVec3),
-    /// graphics quality: 0 low, 1 medium, 2 high (the scene's resolution, QUALITY)
+    /// graphics quality: 0 potato, 1 low, 2 medium, 3 high (the scene's resolution, QUALITY)
     quality: u8,
+    /// what is drawn at all (the renderer's switches), and the cars on the roads
+    lite: render::Lite,
+    cars_on: bool,
     /// render distance: 0 short, 1 medium, 2 far (DISTANCE)
     distance: u8,
     /// joined a room while at the menus: start beside the host once flying
@@ -718,7 +721,19 @@ struct Game {
 }
 
 /// Graphics quality: name, and the scene's resolution as a fraction of the window's.
-const QUALITY: [(&str, f32); 3] = [("Low", 0.5), ("Medium", 0.72), ("High", 1.0)];
+/// Picking one also sets the switches below it (`preset`).
+const QUALITY: [(&str, f32); 4] = [("Potato", 0.4), ("Low", 0.5), ("Medium", 0.72), ("High", 1.0)];
+
+/// The switches each quality preset sets: shadows, ambient occlusion, clouds,
+/// trees, road traffic, and (Potato) the render distance it takes down to Short.
+fn preset(q: u8) -> (render::Lite, bool, Option<u8>) {
+    match q {
+        0 => (render::Lite { shadows: false, ao: false, clouds: false, trees: false }, false, Some(0)),
+        1 => (render::Lite { shadows: false, ao: false, clouds: true, trees: true }, true, None),
+        2 => (render::Lite { shadows: true, ao: false, clouds: true, trees: true }, true, None),
+        _ => (render::Lite::default(), true, None),
+    }
+}
 /// Render distance: name, and how near a map tile must come (its width over
 /// its distance) before it is split into finer ones: lower draws detail,
 /// buildings and roads further out (world.rs, `lod_k`).
@@ -844,7 +859,9 @@ impl Game {
             start_rx: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, gauges: gauges::Gauges::new(&plane, secs.to_bits()), plane,
             airport_rx: None, hold_spot: None, net: { let mut n = net::Net::new(secs.to_bits()); if let Some(name) = crate::plat::load_text("mp_name.txt").filter(|s| !s.trim().is_empty()) { n.name = name.trim().chars().take(24).collect(); } n }, others: std::collections::HashMap::new(), mp_code: String::new(), view: (Mat4::IDENTITY, DVec3::ZERO),
             // Saved from last time; else high on the desktop, medium in the browser (often a weaker machine).
-            quality: setting("quality").unwrap_or(if cfg!(target_arch = "wasm32") { 1 } else { 2 }).min(2),
+            quality: setting("quality").unwrap_or(if cfg!(target_arch = "wasm32") { 2 } else { 3 }).min(3),
+            lite: render::Lite::default(),
+            cars_on: true,
             distance: setting("distance").unwrap_or(if cfg!(target_arch = "wasm32") { 0 } else { 1 }).min(2), mp_meet: false, mp_booms: Vec::new(), mp_crash: None, crash_lent: None, mp_crash_spec: aircraft::ALL[0], mp_fires: Vec::new(), mp_wrecks: Vec::new(),
             pending_airport: args.airport.as_deref().and_then(|c| {
                 let i = airports::Db::get().find(c);
@@ -854,6 +871,12 @@ impl Game {
                 i.map(|i| (i, args.runway.clone(), args.approach))
             }),
         };
+        // The preset's switches, then any set by hand since.
+        let (lite, cars, _) = preset(g.quality);
+        let on = |k: &str, d: bool| setting(k).map_or(d, |v| v != 0);
+        g.lite = render::Lite { shadows: on("shadows", lite.shadows), ao: on("ao", lite.ao), clouds: on("clouds", lite.clouds), trees: on("trees", lite.trees) };
+        g.cars_on = on("cars", cars);
+        g.r.lite = g.lite;
         g.r.set_scale(QUALITY[g.quality as usize].1);
         g.world.lod_k = DISTANCE[g.distance as usize].1;
         // Multiplayer from the command line (or the page address: ?join=K7Q2M).
@@ -2579,7 +2602,9 @@ impl Game {
             self.world.update_photo(&self.r, cam, focus_abs, &frustum, px, day, dt_real);
         }
         if dt > 0.0 {
-            self.world.update_traffic(dt as f32, focus_abs);
+            if self.cars_on {
+                self.world.update_traffic(dt as f32, focus_abs);
+            }
             let local = (self.utc + geo::pos_to_lla(focus_abs).1.to_degrees() / 15.0).rem_euclid(24.0);
             let player = (!self.crashed && !in_menu).then_some(self.plane.pos);
             {
@@ -2858,7 +2883,9 @@ impl Game {
         if !in_menu {
             let local = (self.utc + clon.to_degrees() / 15.0).rem_euclid(24.0);
             let sun_up = geo::enu(cam).2.dot(self.sun_dir());
-            self.world.car_instances(cam, cars::activity(local as f32), sun_up, &mut insts, &mut air_lights);
+            if self.cars_on {
+                self.world.car_instances(cam, cars::activity(local as f32), sun_up, &mut insts, &mut air_lights);
+            }
             self.n_cars = insts.len();
             self.destr.instances(cam, &mut insts, &mut fall);
             self.destr.skin_frame(cam);
@@ -4004,11 +4031,29 @@ impl Game {
                                     if ui.selectable_label(self.quality == i as u8, *name).clicked() && self.quality != i as u8 {
                                         self.quality = i as u8;
                                         self.r.set_scale(QUALITY[i].1);
+                                        let (lite, cars, dist) = preset(i as u8);
+                                        (self.lite, self.cars_on) = (lite, cars);
+                                        if let Some(d) = dist {
+                                            self.distance = d;
+                                            self.world.lod_k = DISTANCE[d as usize].1;
+                                        }
+                                        self.r.lite = self.lite;
                                         self.save_settings();
                                     }
                                 }
                             });
                             ui.end_row();
+                            let mut changed = false;
+                            for (name, v) in [("Shadows", &mut self.lite.shadows), ("Ambient occlusion", &mut self.lite.ao), ("Clouds", &mut self.lite.clouds), ("Trees", &mut self.lite.trees), ("Road traffic", &mut self.cars_on)] {
+                                ui.label(name);
+                                let t = if *v { "on" } else { "off" };
+                                changed |= ui.checkbox(v, t).changed();
+                                ui.end_row();
+                            }
+                            if changed {
+                                self.r.lite = self.lite;
+                                self.save_settings();
+                            }
                             ui.label("Render distance");
                             ui.horizontal(|ui| {
                                 for (i, (name, _)) in DISTANCE.iter().enumerate() {
@@ -4021,7 +4066,7 @@ impl Game {
                             });
                             ui.end_row();
                             ui.label("");
-                            ui.label(RichText::new("Lower quality draws the world at a lower resolution; a shorter render distance keeps buildings, roads and fine ground detail closer in. Both make it smoother on slower computers.").size(12.0).color(DIM));
+                            ui.label(RichText::new("Potato is for the slowest computers (built-in graphics, a Celeron): lowest resolution, short render distance, no shadows, clouds, trees or traffic. Lower quality draws the world at a lower resolution; a shorter render distance keeps buildings, roads and fine ground detail closer in; each switch saves a little more.").size(12.0).color(DIM));
                             ui.end_row();
                             ui.label("Anti-aliasing");
                             ui.checkbox(&mut self.taa, "temporal (TAA)");
@@ -4768,7 +4813,9 @@ impl Game {
     }
 
     fn save_settings(&self) {
-        let _ = crate::plat::save_text("settings.txt", &format!("quality {}\ndistance {}\n", self.quality, self.distance));
+        let l = &self.lite;
+        let b = |v: bool| v as u8;
+        let _ = crate::plat::save_text("settings.txt", &format!("quality {}\ndistance {}\nshadows {}\nao {}\nclouds {}\ntrees {}\ncars {}\n", self.quality, self.distance, b(l.shadows), b(l.ao), b(l.clouds), b(l.trees), b(self.cars_on)));
     }
 
     /// The pause menu's Multiplayer page: host a room or join one, and who is in it.
