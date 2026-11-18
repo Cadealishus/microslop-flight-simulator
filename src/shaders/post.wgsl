@@ -71,15 +71,86 @@ fn finish(scene: vec3f, in: FsIn) -> vec4f {
   c += (ign(in.pos.xy + 17.0) - 0.5) / 255.0;
   return vec4f(c, 1.0);
 }
+// The scene may be drawn smaller than the screen (graphics quality): it is
+// stretched back up here. A plain bilinear stretch is soft and nearest-texel
+// one is blocky, so it is a Catmull-Rom (bicubic) stretch, kept within the
+// 2x2 texels around (no ringing), from nine bilinear taps.
+fn upscale(uv: vec2f) -> vec4f {
+  let size = vec2f(textureDimensions(t_src));
+  let sp = uv * size;
+  let p1 = floor(sp - 0.5) + 0.5;
+  let f = sp - p1;
+  let w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+  let w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+  let w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+  let w3 = f * f * (-0.5 + 0.5 * f);
+  let w12 = w1 + w2;
+  let p0 = (p1 - 1.0) / size;
+  let p3 = (p1 + 2.0) / size;
+  let p12 = (p1 + w2 / w12) / size;
+  var c = vec4f(0.0);
+  c += textureSampleLevel(t_src, s_clamp, vec2f(p0.x, p0.y), 0.0) * w0.x * w0.y;
+  c += textureSampleLevel(t_src, s_clamp, vec2f(p12.x, p0.y), 0.0) * w12.x * w0.y;
+  c += textureSampleLevel(t_src, s_clamp, vec2f(p3.x, p0.y), 0.0) * w3.x * w0.y;
+  c += textureSampleLevel(t_src, s_clamp, vec2f(p0.x, p12.y), 0.0) * w0.x * w12.y;
+  c += textureSampleLevel(t_src, s_clamp, vec2f(p12.x, p12.y), 0.0) * w12.x * w12.y;
+  c += textureSampleLevel(t_src, s_clamp, vec2f(p3.x, p12.y), 0.0) * w3.x * w12.y;
+  c += textureSampleLevel(t_src, s_clamp, vec2f(p0.x, p3.y), 0.0) * w0.x * w3.y;
+  c += textureSampleLevel(t_src, s_clamp, vec2f(p12.x, p3.y), 0.0) * w12.x * w3.y;
+  c += textureSampleLevel(t_src, s_clamp, vec2f(p3.x, p3.y), 0.0) * w3.x * w3.y;
+  let dmax = vec2i(size) - 1;
+  let q = clamp(vec2i(p1), vec2i(0), dmax);
+  let a = textureLoad(t_src, q, 0);
+  let b = textureLoad(t_src, min(q + vec2i(1, 0), dmax), 0);
+  let d = textureLoad(t_src, min(q + vec2i(0, 1), dmax), 0);
+  let e = textureLoad(t_src, min(q + vec2i(1, 1), dmax), 0);
+  return clamp(c, min(min(a, b), min(d, e)), max(max(a, b), max(d, e)));
+}
+
+// How much a stretched-up scene is sharpened back: none at full resolution,
+// more the more it is enlarged (texels per screen pixel, below 1 when enlarged).
+fn upscale_sharpen(uv: vec2f) -> f32 {
+  let k = abs(dpdx(uv.x)) * f32(textureDimensions(t_src).x);
+  return clamp((1.0 / max(k, 0.05) - 1.0) * 0.45, 0.0, 0.7);
+}
+
+// The finished colour with the scene sharpened: against its four neighbours a
+// source texel away, never past the brightest or darkest of them (no halos).
+fn sharpened(uv: vec2f, amount: f32) -> vec3f {
+  let c = upscale(uv);
+  if (amount <= 0.0) {
+    return c.rgb;
+  }
+  let tx = 1.0 / vec2f(textureDimensions(t_src));
+  let n = textureSampleLevel(t_src, s_clamp, uv + vec2f(0.0, -tx.y), 0.0).rgb;
+  let s = textureSampleLevel(t_src, s_clamp, uv + vec2f(0.0, tx.y), 0.0).rgb;
+  let w = textureSampleLevel(t_src, s_clamp, uv + vec2f(-tx.x, 0.0), 0.0).rgb;
+  let e = textureSampleLevel(t_src, s_clamp, uv + vec2f(tx.x, 0.0), 0.0).rgb;
+  let lo = min(min(min(n, s), min(w, e)), c.rgb);
+  let hi = max(max(max(n, s), max(w, e)), c.rgb);
+  return clamp(c.rgb + (c.rgb - (n + s + w + e) * 0.25) * amount, lo, hi);
+}
+
 @fragment fn fs_final(in: FsIn) -> @location(0) vec4f {
-  return finish(textureSampleLevel(t_src, s_clamp, in.uv, 0.0).rgb, in);
+  // (at full resolution: a straight read, as before)
+  let up = upscale_sharpen(in.uv);
+  if (up <= 0.0) {
+    return finish(textureSampleLevel(t_src, s_clamp, in.uv, 0.0).rgb, in);
+  }
+  return finish(sharpened(in.uv, up), in);
 }
 // After temporal anti-aliasing (taa.wgsl), whose alpha says how much each
 // pixel is moving: what moves has been softened by the blend, so sharpen it
 // back, never past the brightest or darkest of its neighbours (no halos).
 const TAA_SHARPEN = 0.8;
 @fragment fn fs_final_taa(in: FsIn) -> @location(0) vec4f {
-  // (the scene may be drawn smaller than the screen: graphics quality)
+  // The scene drawn smaller than the screen (graphics quality): stretched up
+  // smoothly, sharpened for the enlargement and for its motion together.
+  let up = upscale_sharpen(in.uv);
+  if (up > 0.0) {
+    let a = textureSampleLevel(t_src, s_clamp, in.uv, 0.0).a;
+    return finish(sharpened(in.uv, min(up + TAA_SHARPEN * a, 1.2)), in);
+  }
   let dmax = vec2i(textureDimensions(t_src)) - 1;
   let px = clamp(vec2i(in.uv * vec2f(textureDimensions(t_src))), vec2i(0), dmax);
   let c = textureLoad(t_src, px, 0);

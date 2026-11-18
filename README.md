@@ -29,7 +29,7 @@ The first run on Windows or Mac builds the game from this source code, which tak
 **Multiplayer:** fly with friends in a room with a 5-letter code. Windows, Mac and the browser version all play together. Other players appear as the aircraft they're really flying, with green name tags (and a box around them when they're within 3 km). Their crashes play the full explosion, fire and wreck for everyone, and the host's time of day and weather are everyone's. See [Multiplayer](#multiplayer).
 
 **Graphics settings** (pause menu, Settings), saved in `settings.txt`:
-* **Quality**: Potato, Low, Medium, High. Each draws the world at a lower resolution than the next (the menus stay sharp) and sets the switches below. **Potato** is for the slowest computers (built-in graphics, a Celeron, 8 GB): 40% resolution, short render distance, and no shadows, ambient occlusion, clouds, trees or road traffic.
+* **Quality**: Potato, Low, Medium, High. Each draws the world at a lower resolution than the next (the menus stay sharp) and sets the switches below. **Potato** is for the slowest computers (built-in graphics, a Celeron, 8 GB): 40% resolution, short render distance, and no shadows, ambient occlusion, trees or road traffic. A lower resolution is stretched back up smoothly (bicubic) and sharpened, so it stays clean rather than blocky.
 * **Render distance**: Short, Medium, Far: how far out buildings, roads and fine ground detail appear.
 * **Switches**: Shadows, Ambient occlusion, Clouds, Trees, Road traffic, each on or off.
 

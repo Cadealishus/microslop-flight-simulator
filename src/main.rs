@@ -728,7 +728,7 @@ const QUALITY: [(&str, f32); 4] = [("Potato", 0.4), ("Low", 0.5), ("Medium", 0.7
 /// trees, road traffic, and (Potato) the render distance it takes down to Short.
 fn preset(q: u8) -> (render::Lite, bool, Option<u8>) {
     match q {
-        0 => (render::Lite { shadows: false, ao: false, clouds: false, trees: false }, false, Some(0)),
+        0 => (render::Lite { shadows: false, ao: false, clouds: true, trees: false }, false, Some(0)),
         1 => (render::Lite { shadows: false, ao: false, clouds: true, trees: true }, true, None),
         2 => (render::Lite { shadows: true, ao: false, clouds: true, trees: true }, true, None),
         _ => (render::Lite::default(), true, None),
@@ -4066,7 +4066,7 @@ impl Game {
                             });
                             ui.end_row();
                             ui.label("");
-                            ui.label(RichText::new("Potato is for the slowest computers (built-in graphics, a Celeron): lowest resolution, short render distance, no shadows, clouds, trees or traffic. Lower quality draws the world at a lower resolution; a shorter render distance keeps buildings, roads and fine ground detail closer in; each switch saves a little more.").size(12.0).color(DIM));
+                            ui.label(RichText::new("Potato is for the slowest computers (built-in graphics, a Celeron): lowest resolution, short render distance, no shadows, trees or traffic. Lower quality draws the world at a lower resolution; a shorter render distance keeps buildings, roads and fine ground detail closer in; each switch saves a little more.").size(12.0).color(DIM));
                             ui.end_row();
                             ui.label("Anti-aliasing");
                             ui.checkbox(&mut self.taa, "temporal (TAA)");
