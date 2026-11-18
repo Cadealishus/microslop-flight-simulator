@@ -79,8 +79,9 @@ fn finish(scene: vec3f, in: FsIn) -> vec4f {
 // back, never past the brightest or darkest of its neighbours (no halos).
 const TAA_SHARPEN = 0.8;
 @fragment fn fs_final_taa(in: FsIn) -> @location(0) vec4f {
-  let px = vec2i(in.pos.xy);
+  // (the scene may be drawn smaller than the screen: graphics quality)
   let dmax = vec2i(textureDimensions(t_src)) - 1;
+  let px = clamp(vec2i(in.uv * vec2f(textureDimensions(t_src))), vec2i(0), dmax);
   let c = textureLoad(t_src, px, 0);
   let n = textureLoad(t_src, clamp(px + vec2i(0, -1), vec2i(0), dmax), 0).rgb;
   let s = textureLoad(t_src, clamp(px + vec2i(0, 1), vec2i(0), dmax), 0).rgb;

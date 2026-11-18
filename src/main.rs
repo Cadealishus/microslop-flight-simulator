@@ -17,6 +17,7 @@ macro_rules! native {
 }
 
 mod plat;
+mod net;
 mod airframe;
 mod airfield;
 mod airmodels;
@@ -220,6 +221,10 @@ struct Args {
     /// cockpit vertical field of view (deg)
     fov: Option<f32>,
     mute: bool,
+    /// multiplayer: make a room, join one by its code, the name to show
+    mp_host: bool,
+    mp_join: Option<String>,
+    mp_name: Option<String>,
     /// start on the globe menu (default unless a place or scripted run is given)
     menu: Option<bool>,
     menu_view: Option<(f64, f64, f64)>,
@@ -275,6 +280,9 @@ fn parse_args() -> Args {
         cockpit: false,
         fov: None,
         mute: false,
+        mp_host: false,
+        mp_join: None,
+        mp_name: None,
         menu: None,
         menu_view: None,
         menu_go: None,
@@ -434,6 +442,12 @@ fn parse_args() -> Args {
                 a.mute = true;
                 used = 1;
             }
+            "--host" => {
+                a.mp_host = true;
+                used = 1;
+            }
+            "--join" => a.mp_join = v.get(i + 1).cloned(),
+            "--name" => a.mp_name = v.get(i + 1).cloned(),
             "--live" => used = 1,
             "--offline" => {
                 a.offline = true;
@@ -676,6 +690,43 @@ struct Game {
     pending_airport: Option<(u32, Option<String>, bool)>,
     /// waiting on the ground for the terrain to load: where, and until when at most
     hold_spot: Option<(f64, f64, f64)>,
+    /// multiplayer: the room and the others in it, the aircraft state each
+    /// is drawn from (for its moving parts), the code typed to join, and the
+    /// last frame's camera (view-projection, position) for their name tags
+    net: net::Net,
+    others: std::collections::HashMap<u32, Plane>,
+    mp_code: String,
+    view: (Mat4, DVec3),
+    /// graphics quality: 0 low, 1 medium, 2 high (the scene's resolution, QUALITY)
+    quality: u8,
+    /// render distance: 0 short, 1 medium, 2 far (DISTANCE)
+    distance: u8,
+    /// joined a room while at the menus: start beside the host once flying
+    mp_meet: bool,
+    /// other players' crashes: still to set off, their fires (where, size,
+    /// power, since when), and their wrecks (aircraft, where, attitude, since when)
+    mp_booms: Vec<net::Boom>,
+    /// the last other player's crash, run by the game's own crash (fire,
+    /// smoke, the wreck breaking up): it takes `crash`'s place each frame
+    /// while we have not crashed ourselves
+    mp_crash: Option<Crash>,
+    /// `crash` holds that other player's crash this frame (and the type they flew)
+    crash_lent: Option<&'static aircraft::Spec>,
+    mp_crash_spec: &'static aircraft::Spec,
+    mp_fires: Vec<(DVec3, f32, f32, f64)>,
+    mp_wrecks: Vec<(&'static aircraft::Spec, DVec3, DQuat, f64)>,
+}
+
+/// Graphics quality: name, and the scene's resolution as a fraction of the window's.
+const QUALITY: [(&str, f32); 3] = [("Low", 0.5), ("Medium", 0.72), ("High", 1.0)];
+/// Render distance: name, and how near a map tile must come (its width over
+/// its distance) before it is split into finer ones: lower draws detail,
+/// buildings and roads further out (world.rs, `lod_k`).
+const DISTANCE: [(&str, f64); 3] = [("Short", 1.0), ("Medium", 0.62), ("Far", 0.42)];
+
+/// A saved setting from settings.txt ("name value" lines).
+fn setting(name: &str) -> Option<u8> {
+    crate::plat::load_text("settings.txt")?.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.trim().parse().ok())
 }
 
 impl Game {
@@ -791,7 +842,10 @@ impl Game {
             mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, career: career::Career::load(), home_panel: args.panel, mission: None, air_t: 0.0, air_vs: 0.0, career_saved: 0.0, crash_logged: false, offers: (u32::MAX, Vec::new()), heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
             start_rx: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, gauges: gauges::Gauges::new(&plane, secs.to_bits()), plane,
-            airport_rx: None, hold_spot: None,
+            airport_rx: None, hold_spot: None, net: { let mut n = net::Net::new(secs.to_bits()); if let Some(name) = crate::plat::load_text("mp_name.txt").filter(|s| !s.trim().is_empty()) { n.name = name.trim().chars().take(24).collect(); } n }, others: std::collections::HashMap::new(), mp_code: String::new(), view: (Mat4::IDENTITY, DVec3::ZERO),
+            // Saved from last time; else high on the desktop, medium in the browser (often a weaker machine).
+            quality: setting("quality").unwrap_or(if cfg!(target_arch = "wasm32") { 1 } else { 2 }).min(2),
+            distance: setting("distance").unwrap_or(if cfg!(target_arch = "wasm32") { 0 } else { 1 }).min(2), mp_meet: false, mp_booms: Vec::new(), mp_crash: None, crash_lent: None, mp_crash_spec: aircraft::ALL[0], mp_fires: Vec::new(), mp_wrecks: Vec::new(),
             pending_airport: args.airport.as_deref().and_then(|c| {
                 let i = airports::Db::get().find(c);
                 if i.is_none() {
@@ -800,6 +854,18 @@ impl Game {
                 i.map(|i| (i, args.runway.clone(), args.approach))
             }),
         };
+        g.r.set_scale(QUALITY[g.quality as usize].1);
+        g.world.lod_k = DISTANCE[g.distance as usize].1;
+        // Multiplayer from the command line (or the page address: ?join=K7Q2M).
+        if let Some(n) = args.mp_name.as_deref().filter(|n| !n.trim().is_empty()) {
+            g.net.name = n.trim().chars().take(24).collect();
+        }
+        if let Some(code) = &args.mp_join {
+            g.net.join(code);
+        } else if args.mp_host {
+            let code = g.net.host();
+            log::info!("multiplayer: hosting room {code}");
+        }
         // With --menu, an --airport is chosen on the globe rather than flown from.
         if args.menu == Some(true) {
             if let Some((i, rw, appr)) = g.pending_airport.take() {
@@ -2199,6 +2265,8 @@ impl Game {
                     if !imp.water {
                         self.destr.blast_trees(&mut self.world, &self.r.queue, site, (26.0 + 30.0 * power as f64) * reach as f64, gone, &mut femit);
                     }
+                    // Everyone else in the room sees it too.
+                    self.net.crash(&net::Boom { spec: aircraft::ALL.iter().position(|s| std::ptr::eq(*s, self.spec)).unwrap_or(0) as u8, site, vel: imp.vel, rot: self.plane.rot, power: power as f32, size: size as f32, water: imp.water, ..Default::default() });
                     self.crash = Some(crash);
                     self.crashed = true;
                     self.crash_real = self.real;
@@ -2220,6 +2288,12 @@ impl Game {
                 self.destr.booms.push(0.5);
             }
             self.sheds.update(dt as f32, &self.world);
+        }
+        // Another player's crash, when we have none of our own: the same
+        // crash, fire and wreck, run in our crash's place for this frame.
+        if self.crash.is_none() && self.mp_crash.is_some() {
+            self.crash = self.mp_crash.take();
+            self.crash_lent = Some(self.mp_crash_spec);
         }
         let booms: Vec<f32> = self.destr.booms.drain(..).collect();
         if !booms.is_empty() {
@@ -2288,6 +2362,7 @@ impl Game {
             cr.booms.clear();
             cr.splashes.clear();
         }
+        self.mp_effects(dt, &mut femit);
         for (pos, mut p) in femit {
             p.pos = (pos - self.fx_anchor).as_vec3().into();
             emit.push(p);
@@ -2334,9 +2409,9 @@ impl Game {
             self.r.emit(&emit);
         }
 
-        // ---- camera
-        let size = self.window.inner_size();
-        let (w, h) = (size.width.max(1) as f32, size.height.max(1) as f32);
+        // ---- camera (the size the scene is drawn at: see the graphics quality)
+        let (w, h) = self.r.render_size();
+        let (w, h) = (w as f32, h as f32);
         let mut fov = 60f32.to_radians();
         let (cam, dir, upv);
         if !(self.cam_mode == 1 && !self.crashed && !in_menu) {
@@ -2492,6 +2567,7 @@ impl Game {
             Vec2::ZERO
         };
         let vp_jit = Mat4::from_translation(jitter.extend(0.0)) * vp;
+        self.view = (vp, cam);
         let frustum = world::Frustum::new(DMat4::from_cols_array(&vp.to_cols_array().map(|v| v as f64)));
         self.world.update(&self.r, cam, &frustum);
         let focus_abs = if in_menu { cam } else if self.crashed { self.crash.as_ref().unwrap().site } else { self.plane.pos };
@@ -2514,6 +2590,7 @@ impl Game {
             let busy = if self.live.count() > 0 { 0.0 } else { (cars::activity(local as f32) * 1.2).clamp(0.25, 1.0) };
             self.world.update_airports(dt as f32, self.wx.wind_from as f32, (self.wx.wind * 1.94384) as f32, busy, player, focus_abs);
         }
+        self.net_tick(dt_real, in_menu);
 
         // ---- frame constants
         let (east, north, up) = geo::enu(cam);
@@ -2649,6 +2726,9 @@ impl Game {
             self.fx_shift = DVec3::ZERO;
         }
         let mut objs = Vec::new();
+        // (another player's crash in our crash's place: their aircraft's paint)
+        let wspec = self.crash_lent.unwrap_or(self.spec);
+        let wtex = if std::ptr::eq(wspec, self.spec) { 0 } else { self.r.plane_tex_slot(wspec.id as u32 * 4 + wspec.livery as u32, wspec.textures) };
         if let Some(cr) = &self.crash {
             // The ground under an impact up the side of a building is further down.
             psim.anchor = v4(cr.site - cam, -cr.lift);
@@ -2670,7 +2750,7 @@ impl Game {
                         continue;
                     }
                     let m = Mat4::from_scale_rotation_translation(Vec3::splat(d.scale), d.rot.as_quat(), (d.pos - cam).as_vec3()) * Mat4::from_translation(-d.origin);
-                    objs.push(DrawObj { mesh: d.mesh, model: m, tint: [1.0, 1.0, 1.0, d.char], glow: [if d.burn > 0.0 { if d.rigid { 0.35 } else { 1.0 } } else if cr.water { 0.0 } else { 0.25 }, self.spec.id as f32 + 0.25 * self.spec.livery as f32, 0.0, i as f32 * 0.37], cast: 0b11, cut: true, tear: [d.tear[0].gpu(), d.tear[1].gpu()], dmg: [d.tear[0].mode, d.tear[1].mode, 0.6, d.jag], ..DrawObj::DEFAULT });
+                    objs.push(DrawObj { mesh: d.mesh, model: m, tint: [1.0, 1.0, 1.0, d.char], glow: [if d.burn > 0.0 { if d.rigid { 0.35 } else { 1.0 } } else if cr.water { 0.0 } else { 0.25 }, wspec.id as f32 + 0.25 * wspec.livery as f32, 0.0, i as f32 * 0.37], cast: 0b11, cut: true, tear: [d.tear[0].gpu(), d.tear[1].gpu()], dmg: [d.tear[0].mode, d.tear[1].mode, 0.6, d.jag], tex: wtex, ..DrawObj::DEFAULT });
                 }
             }
         }
@@ -2770,6 +2850,7 @@ impl Game {
         }
         if !in_menu {
             self.sheds.draw(cam, params, &mut objs);
+            self.draw_others(cam, params, &mut objs);
         }
         let mut insts = Vec::new();
         let mut fall = Vec::new();
@@ -2857,6 +2938,9 @@ impl Game {
         let (skin_slots, skins) = if in_menu { (Vec::new(), Vec::new()) } else { self.destr.skin_draws() };
         if let Some(map) = self.live.take_clouds() {
             self.r.set_weather_map(&map);
+        }
+        if self.crash_lent.take().is_some() {
+            self.mp_crash = self.crash.take();
         }
         self.r.render(Frame { g, tiles, details, photo, skins, skin_slots, fields, lights: air_lights, objs, insts, fall, near, casc_vp, shore: sf.step, shore_c, shore_tiles, psim, sim_steps: dt > 0.0, fluid, ocean: self.world.ocean.uniform(), egui: Some(ui), shot, logo: (in_menu && !self.menu.home).then(|| self.window.scale_factor() as f32) });
         if (had_shots && crate::plat::args().into_iter().any(|a| a == "--shot") && self.record.is_none()) || rec_done {
@@ -3914,6 +3998,31 @@ impl Game {
                             ui.end_row();
                             menu::heading(ui, "GRAPHICS");
                             ui.end_row();
+                            ui.label("Quality");
+                            ui.horizontal(|ui| {
+                                for (i, (name, _)) in QUALITY.iter().enumerate() {
+                                    if ui.selectable_label(self.quality == i as u8, *name).clicked() && self.quality != i as u8 {
+                                        self.quality = i as u8;
+                                        self.r.set_scale(QUALITY[i].1);
+                                        self.save_settings();
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Render distance");
+                            ui.horizontal(|ui| {
+                                for (i, (name, _)) in DISTANCE.iter().enumerate() {
+                                    if ui.selectable_label(self.distance == i as u8, *name).clicked() && self.distance != i as u8 {
+                                        self.distance = i as u8;
+                                        self.world.lod_k = DISTANCE[i].1;
+                                        self.save_settings();
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("");
+                            ui.label(RichText::new("Lower quality draws the world at a lower resolution; a shorter render distance keeps buildings, roads and fine ground detail closer in. Both make it smoother on slower computers.").size(12.0).color(DIM));
+                            ui.end_row();
                             ui.label("Anti-aliasing");
                             ui.checkbox(&mut self.taa, "temporal (TAA)");
                             ui.end_row();
@@ -3929,6 +4038,7 @@ impl Game {
                         padui::follow_focus(ui);
                     }).inner,
                     Page::Controls => menu::controls_list(ui),
+                    Page::Multiplayer => self.multiplayer_ui(ui),
                     _ => {
                         ui.add_space(4.0);
                         let resume = menu::wide_button(ui, "RESUME", Hint::of("Esc", "B"), true, true);
@@ -4366,6 +4476,57 @@ impl Game {
                     shadow(ui, line, 15.0, Color32::from_rgb(120, 200, 255));
                 });
             }
+            // Multiplayer: the room, and a tag over each of the others (name and distance).
+            if self.net.room.is_some() {
+                egui::Area::new(egui::Id::unique("mp_status")).anchor(Align2::RIGHT_TOP, [-16.0, 12.0]).interactable(false).show(ctx, |ui| {
+                    shadow(ui, self.net.status(), 13.0, Color32::from_rgb(150, 210, 255));
+                });
+                let (vp, vcam) = self.view;
+                let scr = ctx.content_rect();
+                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("mp_tags")));
+                const TAG: Color32 = Color32::from_rgb(80, 235, 110);
+                // A point in the world on the screen (None behind the camera or well off it).
+                let to_screen = |rel: glam::Vec3| -> Option<egui::Pos2> {
+                    let c = vp * rel.extend(1.0);
+                    if c.w <= 0.0 {
+                        return None;
+                    }
+                    let (x, y) = (c.x / c.w, c.y / c.w);
+                    (x.abs() < 1.3 && y.abs() < 1.3).then(|| egui::pos2(scr.left() + (x * 0.5 + 0.5) * scr.width(), scr.top() + (0.5 - y * 0.5) * scr.height()))
+                };
+                for peer in self.net.peers.values().filter(|p| !p.last.away) {
+                    let rel = (peer.shown - vcam).as_vec3();
+                    let d = rel.length();
+                    let Some(at) = to_screen(rel) else { continue };
+                    let dist = if d < 1000.0 { format!("{d:.0} m") } else { format!("{:.1} km", d / 1000.0) };
+                    let text = format!("{}  {dist}", peer.name());
+                    let font = egui::FontId::proportional(13.0);
+                    let stroke = egui::Stroke::new(1.6, TAG);
+                    // Close by: a box around the aircraft (its span across), the tag above it.
+                    let span = aircraft::ALL.get(peer.last.spec as usize).map_or(12.0, |s| s.span as f32);
+                    let r = [glam::Vec3::X, glam::Vec3::Y, glam::Vec3::Z]
+                        .iter()
+                        .filter_map(|ax| to_screen(rel + (peer.shown_rot.as_quat() * *ax) * span * 0.55))
+                        .map(|p| (p - at).length())
+                        .fold(0.0f32, f32::max);
+                    let top = if d < 3000.0 && r > 0.0 {
+                        let r = r.clamp(10.0, 400.0);
+                        let b = egui::Rect::from_center_size(at, egui::vec2(2.0 * r, 2.0 * r));
+                        let k = (r * 0.4).max(6.0);
+                        for (c, dx, dy) in [(b.left_top(), 1.0, 1.0), (b.right_top(), -1.0, 1.0), (b.left_bottom(), 1.0, -1.0), (b.right_bottom(), -1.0, -1.0)] {
+                            painter.line_segment([c, c + egui::vec2(k * dx, 0.0)], stroke);
+                            painter.line_segment([c, c + egui::vec2(0.0, k * dy)], stroke);
+                        }
+                        b.top() - 4.0
+                    } else {
+                        painter.circle_stroke(at, 3.5, stroke);
+                        at.y - 7.0
+                    };
+                    let tp = egui::pos2(at.x, top);
+                    painter.text(tp + egui::vec2(1.0, 1.0), Align2::CENTER_BOTTOM, &text, font.clone(), Color32::from_black_alpha(200));
+                    painter.text(tp, Align2::CENTER_BOTTOM, &text, font, TAG);
+                }
+            }
             if !self.flash.is_empty() && !self.crashed {
                 egui::Area::new(egui::Id::unique("flash")).anchor(Align2::CENTER_TOP, [0.0, 70.0]).show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
@@ -4499,6 +4660,360 @@ impl Game {
         }
         let jobs = self.egui_ctx.tessellate(out.shapes, out.pixels_per_point);
         (jobs, out.textures_delta, out.pixels_per_point)
+    }
+}
+
+/// Multiplayer (see net.rs).
+impl Game {
+    /// Each frame: send ours, take theirs, and in someone else's room, their sky.
+    fn net_tick(&mut self, dt: f64, in_menu: bool) {
+        if self.net.room.is_none() {
+            self.others.clear();
+            return;
+        }
+        let p = &self.plane;
+        let w = &self.wx;
+        let mine = net::State {
+            spec: aircraft::ALL.iter().position(|s| std::ptr::eq(*s, self.spec)).unwrap_or(0) as u8,
+            away: in_menu || self.crashed,
+            pos: p.pos,
+            rot: p.rot,
+            vel: p.vel,
+            stick: p.stick.as_vec3().into(),
+            flaps: p.flaps as f32,
+            slats: p.slats as f32,
+            spoilers: p.spoilers as f32,
+            gear: p.gear as f32,
+            gear_down: p.gear_down,
+            throttle: p.throttle as f32,
+            prop_rate: p.prop_rate as f32,
+            burner: p.burner as f32,
+            n1: p.n1 as f32,
+            sky: net::Sky { utc: self.utc as f32, clouds: w.clouds, cloud_base: w.cloud_base, wind: w.wind as f32, wind_from: w.wind_from as f32, storms: w.storms, haze: w.haze },
+            ..Default::default()
+        };
+        for e in self.net.tick(dt, &mine) {
+            match e {
+                net::Event::Joined(n) => {
+                    log::info!("multiplayer: {n} joined");
+                    self.flash.push((format!("{n} JOINED"), self.real + 2.0));
+                }
+                net::Event::Left(n) => self.flash.push((format!("{n} LEFT"), self.real + 2.0)),
+                net::Event::FirstHost(h) if !in_menu => self.start_beside(&h),
+                net::Event::FirstHost(_) => self.mp_meet = true,
+                net::Event::Crash(b) => {
+                    log::info!("multiplayer: {} crashed", b.name);
+                    self.flash.push((format!("{} CRASHED", b.name.to_uppercase()), self.real + 3.0));
+                    self.mp_booms.push(b);
+                }
+            }
+        }
+        if self.mp_meet && !in_menu && !self.crashed {
+            if let Some(h) = self.net.peers.values().find(|p| p.last.host && !p.last.away).map(|p| p.last.clone()) {
+                self.mp_meet = false;
+                self.start_beside(&h);
+            }
+        }
+        // In someone else's room: their time and weather, so all see the same sky.
+        if !self.net.hosting {
+            self.live.weather = false;
+            if let Some(s) = self.net.sky {
+                let du = (s.utc as f64 - self.utc + 12.0).rem_euclid(24.0) - 12.0;
+                if du.abs() > 0.02 {
+                    self.utc = s.utc as f64;
+                }
+                let w = &mut self.wx;
+                (w.clouds, w.cloud_base, w.wind, w.wind_from, w.storms, w.haze) = (s.clouds, s.cloud_base, s.wind as f64, s.wind_from as f64, s.storms, s.haze);
+            }
+        }
+        // The aircraft each of the others is drawn from: its own type, posed as they fly it.
+        self.others.retain(|id, _| self.net.peers.contains_key(id));
+        for (id, peer) in &self.net.peers {
+            let s = &peer.last;
+            let spec = aircraft::ALL.get(s.spec as usize).copied().unwrap_or(aircraft::ALL[0]);
+            let o = self.others.entry(*id).or_insert_with(|| Plane::spawn(spec, 0.0, 0.0, 1000.0, 0.0, 0.0));
+            if !std::ptr::eq(o.spec, spec) {
+                *o = Plane::spawn(spec, 0.0, 0.0, 1000.0, 0.0, 0.0);
+            }
+            (o.pos, o.rot, o.vel) = (peer.shown, peer.shown_rot, s.vel);
+            o.stick = glam::Vec3::from(s.stick).as_dvec3();
+            (o.flaps, o.slats, o.spoilers, o.gear, o.gear_down) = (s.flaps as f64, s.slats as f64, s.spoilers as f64, s.gear as f64, s.gear_down);
+            (o.throttle, o.prop_rate, o.burner, o.n1) = (s.throttle as f64, s.prop_rate as f64, s.burner as f64, s.n1 as f64);
+            o.prop = (o.prop + o.prop_rate * dt) % std::f64::consts::TAU;
+            o.t += dt;
+            // its model, built in the background the first time it is seen
+            if !std::ptr::eq(spec, self.spec) && !self.hangar.iter().any(|l| std::ptr::eq(l.spec, spec)) && !self.building.iter().any(|(b, _)| std::ptr::eq(*b, spec)) {
+                let (tx, rx) = std::sync::mpsc::channel();
+                crate::plat::task(0.5, move || Loaded::make(spec), move |m| {
+                    let _ = tx.send(m);
+                });
+                self.building.push((spec, rx));
+            }
+        }
+        // Models finished in the background go into the hangar.
+        let mut i = 0;
+        while i < self.building.len() {
+            match self.building[i].1.try_recv() {
+                Ok(m) => {
+                    let (spec, _) = self.building.swap_remove(i);
+                    let l = Loaded::upload(spec, m, &mut self.r);
+                    self.hangar.push(l);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => i += 1,
+                Err(_) => {
+                    self.building.swap_remove(i);
+                }
+            }
+        }
+    }
+
+    fn save_settings(&self) {
+        let _ = crate::plat::save_text("settings.txt", &format!("quality {}\ndistance {}\n", self.quality, self.distance));
+    }
+
+    /// The pause menu's Multiplayer page: host a room or join one, and who is in it.
+    fn multiplayer_ui(&mut self, ui: &mut egui::Ui) {
+        use egui::{Color32, RichText};
+        const DIM: Color32 = Color32::from_rgb(150, 165, 190);
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Your name");
+            let r = ui.add(egui::TextEdit::singleline(&mut self.net.name).char_limit(24).desired_width(200.0));
+            if r.lost_focus() {
+                let _ = crate::plat::save_text("mp_name.txt", &self.net.name);
+            }
+        });
+        ui.add_space(8.0);
+        match self.net.room.clone() {
+            None => {
+                if menu::wide_button(ui, "HOST A ROOM", Hint::Text("get a code for your friends"), true, true).clicked() {
+                    let code = self.net.host();
+                    self.flash.push((format!("ROOM {code}"), self.real + 3.0));
+                }
+                ui.add_space(10.0);
+                ui.label("Or join a friend's room:");
+                let mut go = false;
+                ui.horizontal(|ui| {
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.mp_code).hint_text("code, e.g. K7Q2M").char_limit(8).desired_width(140.0).font(egui::FontId::monospace(18.0)));
+                    go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    go |= ui.button(RichText::new("Join").size(16.0)).clicked();
+                });
+                if go && !self.net.join(&self.mp_code) {
+                    self.status = "A room code is 5 letters and numbers".into();
+                    self.status_until = self.real + 4.0;
+                }
+            }
+            Some(code) => {
+                ui.label(RichText::new("ROOM CODE").size(12.0).color(DIM));
+                ui.label(RichText::new(&code).size(34.0).monospace().strong().color(Color32::WHITE));
+                ui.label(RichText::new(if self.net.hosting { "Send this code to your friends. Your time of day and weather are everyone's." } else { "In a friend's room: their time of day and weather are yours." }).size(12.0).color(DIM));
+                ui.add_space(6.0);
+                ui.label(self.net.status());
+                ui.add_space(4.0);
+                for peer in self.net.peers.values() {
+                    let ac = aircraft::ALL.get(peer.last.spec as usize).map_or("?", |s| s.name);
+                    let d = (peer.shown - self.plane.pos).length();
+                    let where_ = if peer.last.away { "at the menus".to_string() } else if d < 1000.0 { format!("{d:.0} m away") } else { format!("{:.1} km away", d / 1000.0) };
+                    ui.label(format!("{}{}  ·  {ac}  ·  {where_}", if peer.last.host { "★ " } else { "" }, peer.name()));
+                }
+                ui.add_space(8.0);
+                if menu::wide_button(ui, "Leave the room", Hint::None, false, true).clicked() {
+                    self.net.leave();
+                    self.others.clear();
+                }
+            }
+        }
+        ui.add_space(10.0);
+        ui.label(RichText::new("Windows, Mac and the browser version all play together. Rooms go through a free public relay: anyone with the code can join.").size(12.0).color(DIM));
+    }
+
+    /// Just joined: start beside the host, flying as they are (or parked
+    /// beside them, should they be on the ground).
+    fn start_beside(&mut self, h: &net::State) {
+        let up = h.pos.normalize();
+        let flat = |v: DVec3| (v - up * v.dot(up)).normalize_or(DVec3::X);
+        let (fwd, right) = (flat(h.rot * DVec3::NEG_Z), flat(h.rot * DVec3::X));
+        let speed = h.vel.length();
+        let (e, n, _) = geo::enu(h.pos);
+        let heading = fwd.dot(e).atan2(fwd.dot(n));
+        if speed < 25.0 {
+            let (lat, lon, _) = geo::pos_to_lla(h.pos + right * 40.0);
+            let g = self.world.ground(lat, lon).map_or(geo::pos_to_lla(h.pos).2, |g| g.h as f64);
+            self.respawn_ground(lat, lon, g, heading, 0.0);
+        } else {
+            let (lat, lon, alt) = geo::pos_to_lla(h.pos - fwd * 80.0 + right * 50.0);
+            self.respawn_at(lat, lon, alt, heading, speed);
+        }
+        let name = if h.name.is_empty() { "the host" } else { &h.name };
+        log::info!("multiplayer: started beside {name}");
+        self.flash.push((format!("FLYING WITH {}", name.to_uppercase()), self.real + 3.0));
+    }
+
+    /// Other players' crashes, as seen from outside: the flash and fireball,
+    /// what the blast knocks down, the boom, then the wreck burning for a
+    /// few minutes.
+    fn mp_effects(&mut self, dt: f64, femit: &mut Vec<(DVec3, render::Particle)>) {
+        for b in std::mem::take(&mut self.mp_booms) {
+            let d = (b.site - self.cam_pos).length();
+            if d > 40_000.0 {
+                continue;
+            }
+            let spec = aircraft::ALL.get(b.spec as usize).copied().unwrap_or(aircraft::ALL[0]);
+            // The game's own crash, as for ours: unless ours is burning (it has
+            // the one fire simulation), or their model is not built yet.
+            let own = self.crash.is_some() && self.crash_lent.is_none();
+            let meshes = if std::ptr::eq(spec, self.spec) {
+                Some((&self.group_mesh, &self.model.groups, &self.group_pivots))
+            } else {
+                self.hangar.iter().find(|l| std::ptr::eq(l.spec, spec)).map(|l| (&l.group_mesh, &l.model.groups, &l.group_pivots))
+            };
+            if let (false, Some((gm, groups, pivots))) = (own, meshes) {
+                let mut p = Plane::spawn(spec, 0.0, 0.0, 1000.0, 0.0, 0.0);
+                (p.pos, p.rot, p.vel) = (b.site, b.rot, b.vel);
+                let (la, lo, _) = geo::pos_to_lla(b.site);
+                let ground_h = self.world.ground(la, lo).map_or(geo::pos_to_lla(b.site).2, |g| g.h as f64);
+                let imp = plane::Impact { pos: b.site, vel: b.vel, water: b.water, ground_h, building: None };
+                let tears = vec![[Tear::NONE; 2]; airframe::N_GROUPS];
+                let crash = Crash::new(&imp, &p, gm, groups, pivots, &tears, 0.0, self.rng.0 ^ self.frame ^ 0x5bd1, self.wx.steady(b.site, 40.0));
+                self.r.clear_particles();
+                self.r.fluid.latest = None;
+                self.fx_anchor = b.site;
+                self.world_blast(&b, femit);
+                // into the slot now (it goes back to `mp_crash` at the end of the frame)
+                self.crash = Some(crash);
+                self.crash_lent = Some(spec);
+                self.mp_crash_spec = spec;
+                continue;
+            }
+            self.anchor_fx(b.site);
+            let (p, s, ss) = (b.power.clamp(0.3, 2.0), b.size.powf(0.9), b.size.sqrt());
+            let up = b.site.normalize().as_vec3();
+            let r = &mut self.rng;
+            femit.push((b.site + (up * 2.0 * s).as_dvec3(), render::Particle { life: 0.22 * ss, size0: 10.0 * p * s, size1: 30.0 * p * s, kind: crash::FLASH, alpha: 1.6 * p, ..Default::default() }));
+            for _ in 0..((84.0 * p * ss) as usize).min(320) {
+                let dir = r.dir();
+                let k = r.f().cbrt();
+                femit.push((b.site + (dir * k * 3.2 * p * s).as_dvec3(), render::Particle { vel: ((dir * k * 27.0 * p + up * r.range(4.0, 9.0) * p) * ss).into(), life: r.range(3.4, 5.6) * ss, size0: r.range(2.8, 4.2) * p * s, size1: r.range(10.0, 14.5) * p * s, temp: r.range(2.3, 3.1), kind: crash::GAS, drag: r.range(1.9, 2.4) / ss, buoy: r.range(7.0, 10.0), seed: r.f(), alpha: r.range(0.75, 0.95), ..Default::default() }));
+            }
+            if b.water {
+                for _ in 0..(60.0 * ss) as usize {
+                    let v = r.dir() * 6.0 + up * r.range(10.0, 30.0);
+                    femit.push((b.site, render::Particle { vel: v.into(), life: r.range(1.0, 2.5), size0: r.range(0.5, 1.0), size1: r.range(2.0, 4.0), kind: crash::DROPS, drag: 0.4, seed: r.f(), alpha: 0.5, ..Default::default() }));
+                }
+            } else {
+                self.world_blast(&b, femit);
+            }
+            if let Some(a) = &self.audio {
+                a.boom(b.power * (1.0 - (d / 8000.0) as f32).clamp(0.0, 1.0).powi(2));
+            }
+            let spec = aircraft::ALL.get(b.spec as usize).copied().unwrap_or(aircraft::ALL[0]);
+            if !b.water {
+                self.mp_fires.push((b.site, b.size, b.power, self.real));
+                self.mp_wrecks.push((spec, b.site, b.rot, self.real));
+            }
+        }
+        // The fires: flames and a column of smoke, dying down over three minutes.
+        if dt > 0.0 {
+            let now = self.real;
+            for (site, size, power, t0) in &self.mp_fires {
+                let age = (now - t0) as f32;
+                let left = (1.0 - age / 180.0).max(0.0);
+                if left <= 0.0 || (*site - self.cam_pos).length() > 40_000.0 {
+                    continue;
+                }
+                let up = site.normalize().as_vec3();
+                let ss = size.sqrt();
+                let r = &mut self.rng;
+                let n = dt as f32 * 24.0 * ss * left * power.clamp(0.5, 1.5);
+                let mut k = n;
+                while k > 0.0 && r.f() < k {
+                    k -= 1.0;
+                    let at = *site + (r.dir() * 2.5 * ss).as_dvec3();
+                    femit.push((at, render::Particle { vel: (up * r.range(2.0, 5.0)).into(), life: r.range(0.6, 1.2), size0: r.range(0.6, 1.2) * ss, size1: r.range(1.6, 2.8) * ss, temp: r.range(0.9, 1.3), kind: crash::GAS, drag: 0.9, buoy: 2.5, seed: r.f(), alpha: 0.7, ..Default::default() }));
+                    femit.push((at + (up * 3.0).as_dvec3(), render::Particle { vel: (up * r.range(3.0, 6.0) + r.dir() * 1.0).into(), life: r.range(10.0, 18.0), size0: r.range(3.0, 5.0) * ss, size1: r.range(18.0, 32.0) * ss, temp: 0.0, kind: crash::SOOT, drag: 0.5, buoy: 2.0, seed: r.f(), alpha: 0.75 * left, ..Default::default() }));
+                }
+            }
+            self.mp_fires.retain(|f| now - f.3 < 180.0);
+            self.mp_wrecks.retain(|w| now - w.3 < 300.0);
+        }
+    }
+
+    /// What another player's crash does to the ground and what stood on it,
+    /// as our own crash does: a crater, the buildings and trees around knocked down.
+    fn world_blast(&mut self, b: &net::Boom, femit: &mut Vec<(DVec3, render::Particle)>) {
+        if b.water {
+            return;
+        }
+        let heavy = b.size > 2.0;
+        let reach = if heavy { b.size.powf(0.6) } else { 1.0 };
+        let steep = (-b.vel.dot(b.site.normalize()) / b.vel.length().max(1.0)).clamp(0.0, 1.0) as f32;
+        let rad = (3.0 + 5.0 * b.power) * (1.0 + (b.size.sqrt() - 1.0) * steep);
+        self.world.add_crater(b.site, rad);
+        self.destr.eject(b.site, rad, b.vel, femit);
+        for (t, i) in self.world.buildings_near(b.site, (9.0 * b.power * reach).max(rad + 4.0 * reach) as f64, if heavy { 900.0 } else { 400.0 }) {
+            self.bring_down(t, i, b.site, b.vel * 0.3, None, femit);
+        }
+        self.destr.blast_trees(&mut self.world, &self.r.queue, b.site, (26.0 + 30.0 * b.power as f64) * reach as f64, rad as f64, femit);
+    }
+
+    /// The others, for the frame (their pieces, posed and placed).
+    fn draw_others(&mut self, cam: DVec3, params: [[f32; 4]; 6], objs: &mut Vec<DrawObj>) {
+        for (id, peer) in &self.net.peers {
+            let Some(o) = self.others.get(id) else { continue };
+            if peer.last.away || (peer.shown - cam).length() > 40_000.0 {
+                continue;
+            }
+            let spec = o.spec;
+            let (model, piece_mesh, piece_cut) = if std::ptr::eq(spec, self.spec) {
+                (&self.model, &self.piece_mesh, &self.piece_cut)
+            } else if let Some(l) = self.hangar.iter().find(|l| std::ptr::eq(l.spec, spec)) {
+                (&l.model, &l.piece_mesh, &l.piece_cut)
+            } else {
+                continue;
+            };
+            let tex = if std::ptr::eq(spec, self.spec) { 0 } else { self.r.plane_tex_slot(spec.id as u32 * 4 + spec.livery as u32, spec.textures) };
+            let base = Mat4::from_rotation_translation(o.rot.as_quat(), (o.pos - cam).as_vec3());
+            let pose = o.pose(&model.pieces);
+            let blur = ((o.prop_rate - 30.0) / 25.0).clamp(0.0, 1.0) as f32;
+            let kind = spec.id as f32 + 0.25 * spec.livery as f32;
+            let (burner, dry) = match &spec.engine {
+                aircraft::Engine::Fan(fe) => (o.burner as f32, ((o.n1 - fe.idle) / (1.0 - fe.idle)).clamp(0.0, 1.0) as f32),
+                _ => (0.0, 0.0),
+            };
+            for (i, p) in model.pieces.iter().enumerate() {
+                let hide = match p.vis {
+                    airframe::Vis::Always => false,
+                    airframe::Vis::SlowProp => blur >= 1.0,
+                    airframe::Vis::FastProp => blur <= 0.0,
+                };
+                if hide {
+                    continue;
+                }
+                objs.push(DrawObj { mesh: piece_mesh[i], model: base * pose[i], tint: [blur, burner, dry, 0.0], glow: [0.0, kind, 0.0, 0.0], params, cast: 0b11, glass: p.glass, cut: piece_cut[i], tex, ..DrawObj::DEFAULT });
+            }
+        }
+        // Their wrecks: the airframe where it came down, burnt.
+        for (spec, site, rot, t0) in &self.mp_wrecks {
+            if (*site - cam).length() > 20_000.0 {
+                continue;
+            }
+            let spec = *spec;
+            let Some((model, piece_mesh)) = (if std::ptr::eq(spec, self.spec) { Some((&self.model, &self.piece_mesh)) } else { self.hangar.iter().find(|l| std::ptr::eq(l.spec, spec)).map(|l| (&l.model, &l.piece_mesh)) }) else { continue };
+            let tex = if std::ptr::eq(spec, self.spec) { 0 } else { self.r.plane_tex_slot(spec.id as u32 * 4 + spec.livery as u32, spec.textures) };
+            let burn = (1.0 - ((self.real - t0) / 180.0) as f32).clamp(0.0, 1.0);
+            // settled on the ground, nose down a little, belly to the dirt
+            let up = site.normalize();
+            let fwd = (*rot * DVec3::NEG_Z - up * (*rot * DVec3::NEG_Z).dot(up)).normalize_or(up.any_orthonormal_vector());
+            let r = DQuat::from_mat3(&glam::DMat3::from_cols(fwd.cross(up).normalize(), up, -fwd));
+            let base = Mat4::from_rotation_translation(r.as_quat(), (*site + up * 0.6 - cam).as_vec3());
+            let kind = spec.id as f32 + 0.25 * spec.livery as f32;
+            for (i, p) in model.pieces.iter().enumerate() {
+                if p.glass || !matches!(p.vis, airframe::Vis::Always) {
+                    continue;
+                }
+                objs.push(DrawObj { mesh: piece_mesh[i], model: base, tint: [1.0, 1.0, 1.0, 0.85], glow: [0.6 * burn, kind, 0.0, i as f32 * 0.37], params, cast: 0b11, tex, ..DrawObj::DEFAULT });
+            }
+        }
     }
 }
 

@@ -606,10 +606,12 @@ pub struct DrawObj {
     pub dmg: [f32; 4],
     /// oil film on the windshield, crack centre z and y, crack size
     pub dmg2: [f32; 4],
+    /// whose paint textures: 0 the player's aircraft, else Renderer::plane_tex_slot's
+    pub tex: u8,
 }
 
 impl DrawObj {
-    pub const DEFAULT: DrawObj = DrawObj { mesh: 0, model: Mat4::IDENTITY, tint: [0.0; 4], glow: [0.0; 4], params: [[0.0; 4]; 6], cast: 0, glass: false, cut: false, tear: [[0.0; 4]; 2], dmg: [0.0; 4], dmg2: [0.0; 4] };
+    pub const DEFAULT: DrawObj = DrawObj { mesh: 0, model: Mat4::IDENTITY, tint: [0.0; 4], glow: [0.0; 4], params: [[0.0; 4]; 6], cast: 0, glass: false, cut: false, tear: [[0.0; 4]; 2], dmg: [0.0; 4], dmg2: [0.0; 4], tex: 0 };
 }
 
 pub struct Frame<'a> {
@@ -769,6 +771,10 @@ pub struct Renderer {
     build_ub: wgpu::Buffer,
     obj_ub: wgpu::Buffer,
     bg_obj: wgpu::BindGroup,
+    /// other aircraft types' paint (multiplayer): key, bind group (DrawObj::tex = index + 1)
+    bg_obj_more: Vec<(u32, wgpu::BindGroup)>,
+    /// the scene's resolution as a fraction of the window's (graphics quality)
+    scale: f32,
     l_obj: wgpu::BindGroupLayout,
     /// the Hornet's paint (bound with every aircraft's textures)
     paint: wgpu::TextureView,
@@ -1240,6 +1246,11 @@ pub fn wgsl(s: std::borrow::Cow<'_, str>) -> wgpu::ShaderSource<'_> {
     return wgpu::ShaderSource::Wgsl(format!("diagnostic(off, derivative_uniformity);\n{s}").into());
     #[cfg(not(target_arch = "wasm32"))]
     wgpu::ShaderSource::Wgsl(s)
+}
+
+/// A size times a scale, at least a pixel.
+fn scaled(w: u32, h: u32, s: f32) -> (u32, u32) {
+    (((w as f32 * s).round() as u32).max(1), ((h as f32 * s).round() as u32).max(1))
 }
 
 impl Renderer {
@@ -1908,7 +1919,7 @@ impl Renderer {
         let fluid = crate::fluid::FluidGpu::new(d, &l0, common, &vol_acc);
 
         let egui = egui_wgpu::Renderer::new(d, wgpu::TextureFormat::Rgba8Unorm, egui_wgpu::RendererOptions::default());
-        let targets = Self::make_targets(d, &config, &l_dres, &l_ao, &l_composite, &l_cloud, &l_cloud_apply, &l_cloud_temporal, &l_post, &l_pdraw, &l_glass, &psim_ub, &pbuf, &black, &wx_view);
+        let targets = Self::make_targets(d, &config, 1.0, &l_dres, &l_ao, &l_composite, &l_cloud, &l_cloud_apply, &l_cloud_temporal, &l_post, &l_pdraw, &l_glass, &psim_ub, &pbuf, &black, &wx_view);
         let fluid_t = fluid.draw_targets(d, &targets.depth, config.width, config.height);
         // The transmittance and multi-scatter tables depend only on the planet
         // and the haze: bake them now, and again whenever the haze changes.
@@ -1926,7 +1937,7 @@ impl Renderer {
             ground_mats,
             casc_ub, bg_casc, bg_tileu, l_dres, l_ao, p_gtao, p_ao_blur, p_dres, p_road, p_field, p_lights, dyn_lights, p_tree, p_tree_near, imp, p_tree_shadow, p_tree_shadow_fixed, p_card, near_buf, p_inst, p_inst_shadow, inst_buf, fall_buf, tree_lib: None, inst_lib: None,
             globals_ub, bg0, bg0_pre, bg0_shadow, lut_sky, shadow, l_tile, l_build, l_composite, l_cloud, l_cloud_apply, l_cloud_temporal, l_post, l_pdraw, l_glass,
-            tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, build_ub, obj_ub, bg_obj, l_obj, paint, tile_ibuf, tile_nidx: ix.len() as u32,
+            tile_ub, l_photo, photo_ub, p_photo, p_photo_mask, p_photo_shadow, p_photo_shadow_fast, l_skin, p_skin, skin_slots, p_water_top, p_lamp_top, photo_mask, photo_mask_dirty: true, build_ub, obj_ub, bg_obj, bg_obj_more: Vec::new(), scale: 1.0, l_obj, paint, tile_ibuf, tile_nidx: ix.len() as u32,
             p_sky, p_terrain, p_terrain_tess, p_terrain_cells, tess_ibuf, tess_nidx: tix.len() as u32, cell_ibuf, p_build, p_build_shadow, p_obj, p_obj_shadow, p_obj_solid, p_obj_shadow_solid, p_glass, p_composite, p_cloud, p_cloud_apply, p_cloud_temporal, p_particles, p_taa, p_psim, p_down, p_up, p_final, p_final_taa, p_blit, p_logo,
             psim_ub, pbuf, bg_psim, phead: 0, p_vol, bg_vol_a, bg_vol_b, vol_acc, fluid, fluid_t, ocean, shore, p_shore_cover, smoke_until: 0.0, now: 0.0, black, wx_tex, wx_view, targets, cloud_flip: 0, cloud_hist_ok: false, cshadow, lut_bake, lut_haze: 1.0, taa_flip: 0, taa_hist_ok: false, meshes: Vec::new(), egui, logo_font: crate::logo::find_font(), logo_key: None, surface, config, queue, device,
         })
@@ -1934,10 +1945,11 @@ impl Renderer {
 
     #[allow(clippy::too_many_arguments)]
     fn make_targets(
-        d: &wgpu::Device, config: &wgpu::SurfaceConfiguration, l_dres: &wgpu::BindGroupLayout, l_ao: &wgpu::BindGroupLayout, l_composite: &wgpu::BindGroupLayout, l_cloud: &wgpu::BindGroupLayout, l_cloud_apply: &wgpu::BindGroupLayout, l_cloud_temporal: &wgpu::BindGroupLayout,
+        d: &wgpu::Device, config: &wgpu::SurfaceConfiguration, scale: f32, l_dres: &wgpu::BindGroupLayout, l_ao: &wgpu::BindGroupLayout, l_composite: &wgpu::BindGroupLayout, l_cloud: &wgpu::BindGroupLayout, l_cloud_apply: &wgpu::BindGroupLayout, l_cloud_temporal: &wgpu::BindGroupLayout,
         l_post: &wgpu::BindGroupLayout, l_pdraw: &wgpu::BindGroupLayout, l_glass: &wgpu::BindGroupLayout, psim_ub: &wgpu::Buffer, pbuf: &wgpu::Buffer, black: &wgpu::TextureView, wx: &wgpu::TextureView,
     ) -> Targets {
-        let (w, h) = (config.width, config.height);
+        let (fw, fh) = (config.width, config.height);
+        let (w, h) = scaled(fw, fh, scale);
         let rt = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
         let ms = |label: &str, f| view(&make_tex_ms(d, label, w, h, 1, 1, f, rt, MSAA));
         let (color_ms, aux_ms, amb_ms, depth_ms) = (ms("color ms", HDR), ms("aux ms", HDR), ms("amb ms", AMB), ms("depth ms", DEPTH));
@@ -1956,9 +1968,9 @@ impl Renderer {
         let cloud_hist = [view(&make_tex(d, "cloud hist 0", cw, ch, 1, 1, HDR, rt)), view(&make_tex(d, "cloud hist 1", cw, ch, 1, 1, HDR, rt))];
         let bloom_tex = make_tex(d, "bloom", (w / 2).max(64), (h / 2).max(64), 1, BLOOM_MIPS, HDR, rt);
         let bloom: Vec<_> = (0..BLOOM_MIPS).map(|i| bloom_tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: i, mip_level_count: Some(1), ..Default::default() })).collect();
-        let ldr_tex = make_tex(d, "ldr", w, h, 1, 1, wgpu::TextureFormat::Rgba8Unorm, rt | wgpu::TextureUsages::COPY_SRC);
+        let ldr_tex = make_tex(d, "ldr", fw, fh, 1, 1, wgpu::TextureFormat::Rgba8Unorm, rt | wgpu::TextureUsages::COPY_SRC);
         let ldr = view(&ldr_tex);
-        let logo_tex = make_tex(d, "logo", w, h, 1, 1, wgpu::TextureFormat::R8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let logo_tex = make_tex(d, "logo", fw, fh, 1, 1, wgpu::TextureFormat::R8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         let logo = view(&logo_tex);
         let taa = [view(&make_tex(d, "taa 0", w, h, 1, 1, HDR, rt)), view(&make_tex(d, "taa 1", w, h, 1, 1, HDR, rt))];
         let bg = |l: &wgpu::BindGroupLayout, e: &[wgpu::BindGroupEntry]| d.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: l, entries: e });
@@ -2016,8 +2028,27 @@ impl Renderer {
         self.cshadow.ok = false;
         self.taa_hist_ok = false;
         self.logo_key = None;
-        self.targets = Self::make_targets(&self.device, &self.config, &self.l_dres, &self.l_ao, &self.l_composite, &self.l_cloud, &self.l_cloud_apply, &self.l_cloud_temporal, &self.l_post, &self.l_pdraw, &self.l_glass, &self.psim_ub, &self.pbuf, &self.black, &self.wx_view);
-        self.fluid_t = self.fluid.draw_targets(&self.device, &self.targets.depth, w, h);
+        self.targets = Self::make_targets(&self.device, &self.config, self.scale, &self.l_dres, &self.l_ao, &self.l_composite, &self.l_cloud, &self.l_cloud_apply, &self.l_cloud_temporal, &self.l_post, &self.l_pdraw, &self.l_glass, &self.psim_ub, &self.pbuf, &self.black, &self.wx_view);
+        let (rw, rh) = self.render_size();
+        self.fluid_t = self.fluid.draw_targets(&self.device, &self.targets.depth, rw, rh);
+    }
+
+    /// Draw the scene at this fraction of the window's resolution (stretched
+    /// back up for the screen; the menus and HUD stay sharp).
+    pub fn set_scale(&mut self, s: f32) {
+        let s = s.clamp(0.3, 1.0);
+        if (s - self.scale).abs() < 1e-3 {
+            return;
+        }
+        self.scale = s;
+        let (w, h) = (self.config.width, self.config.height);
+        self.config.width = 0;
+        self.resize(w, h);
+    }
+
+    /// The size the scene is drawn at.
+    pub fn render_size(&self) -> (u32, u32) {
+        scaled(self.config.width, self.config.height, self.scale)
     }
 
     pub fn upload_tile(&self, t: &crate::sources::TileData) -> TileGpu {
@@ -2132,6 +2163,17 @@ impl Renderer {
 
     /// The textures of the aircraft about to be flown (`Spec::textures`), in
     /// place of the last one's.
+    /// Another aircraft type's paint, for DrawObj::tex (made once per key).
+    pub fn plane_tex_slot(&mut self, key: u32, tex: &[(&[u8], Option<&[u8]>)]) -> u8 {
+        if let Some(i) = self.bg_obj_more.iter().position(|(k, _)| *k == key) {
+            return i as u8 + 1;
+        }
+        let t = plane_textures(&self.device, &self.queue, tex);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.l_obj, entries: &[buf_res(0, &self.obj_ub, std::mem::size_of::<ObjU>() as u64), tex_res(1, &self.paint), tex_res(2, &t)] });
+        self.bg_obj_more.push((key, bg));
+        self.bg_obj_more.len() as u8
+    }
+
     pub fn set_plane_textures(&mut self, tex: &[(&[u8], Option<&[u8]>)]) {
         let t = plane_textures(&self.device, &self.queue, tex);
         self.bg_obj = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.l_obj, entries: &[buf_res(0, &self.obj_ub, std::mem::size_of::<ObjU>() as u64), tex_res(1, &self.paint), tex_res(2, &t)] });
@@ -2566,7 +2608,7 @@ impl Renderer {
                     cur = Some(o.cut);
                 }
                 let m = &self.meshes[o.mesh];
-                rp.set_bind_group(1, &self.bg_obj, &[i as u32 * 256]);
+                rp.set_bind_group(1, if o.tex == 0 { &self.bg_obj } else { self.bg_obj_more.get(o.tex as usize - 1).map_or(&self.bg_obj, |b| &b.1) }, &[i as u32 * 256]);
                 rp.set_vertex_buffer(0, m.vbuf.slice(..));
                 rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 rp.draw_indexed(0..m.n_idx, 0, 0..1);
@@ -2713,7 +2755,7 @@ impl Renderer {
                     }
                     rp.set_pipeline(if o.cut { &self.p_obj_shadow } else { &self.p_obj_shadow_solid });
                     let m = &self.meshes[o.mesh];
-                    rp.set_bind_group(1, &self.bg_obj, &[i as u32 * 256]);
+                    rp.set_bind_group(1, if o.tex == 0 { &self.bg_obj } else { self.bg_obj_more.get(o.tex as usize - 1).map_or(&self.bg_obj, |b| &b.1) }, &[i as u32 * 256]);
                     rp.set_vertex_buffer(0, m.vbuf.slice(..));
                     rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                     rp.draw_indexed(0..m.n_idx, 0, 0..1);
@@ -2872,7 +2914,7 @@ impl Renderer {
         if f.objs.iter().take(n_objs).any(|o| o.glass) {
             // The windows bend what is seen through them, so they read the
             // scene from a copy. The depth stays read-only: it is sampled too.
-            let (w, h) = (self.config.width.max(1), self.config.height.max(1));
+            let (w, h) = self.render_size();
             enc.copy_texture_to_texture(t.hdr_tex.as_image_copy(), t.scene_tex.as_image_copy(), wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
             let ds = wgpu::RenderPassDepthStencilAttachment { view: &t.depth, depth_ops: None, stencil_ops: None };
             let mut rp = enc.begin_render_pass(&pass_desc(&[Some(color_att(&t.hdr, false))], Some(ds)));
@@ -2884,7 +2926,7 @@ impl Renderer {
                     continue;
                 }
                 let m = &self.meshes[o.mesh];
-                rp.set_bind_group(1, &self.bg_obj, &[i as u32 * 256]);
+                rp.set_bind_group(1, if o.tex == 0 { &self.bg_obj } else { self.bg_obj_more.get(o.tex as usize - 1).map_or(&self.bg_obj, |b| &b.1) }, &[i as u32 * 256]);
                 rp.set_vertex_buffer(0, m.vbuf.slice(..));
                 rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 rp.draw_indexed(0..m.n_idx, 0, 0..1);

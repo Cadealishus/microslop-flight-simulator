@@ -26,6 +26,10 @@ The first run on Windows or Mac builds the game from this source code, which tak
 
 **Sound:** engines, wind, gear, flaps and cockpit warnings are made by a synthesizer as you fly, not from recordings (apart from the fighters' roar and the menu music).
 
+**Multiplayer:** fly with friends in a room with a 5-letter code. Windows, Mac and the browser version all play together. Other players appear as the aircraft they're really flying, with green name tags (and a box around them when they're within 3 km). Their crashes play the full explosion, fire and wreck for everyone, and the host's time of day and weather are everyone's. See [Multiplayer](#multiplayer).
+
+**Graphics settings** (pause menu, Settings): **Quality** (Low, Medium, High) draws the world at a lower resolution for slower computers, keeping the menus sharp; **Render distance** (Short, Medium, Far) sets how far out buildings, roads and fine ground detail appear. Both are saved in `settings.txt`.
+
 **Game modes**, from the main menu:
 * **Free Flight:** pick any spot or airport on the globe, an aircraft, the time and the weather.
 * **World Photographer:** a scenic spot with the HUD hidden; take photos with F12.
@@ -66,6 +70,18 @@ The first run on Windows or Mac builds the game from this source code, which tak
 
 **Gamepad (Xbox layout, as Microsoft Flight Simulator sets it up):** left stick pitch and roll, triggers rudder, hold A / B throttle up / down, hold X brakes, Y + B parking brake, Y + d-pad trim, bumpers flaps, left stick click gear, right stick look around, d-pad quick views, View button cockpit or chase camera, Menu button pause.
 
+# Multiplayer
+
+1. One player opens the pause menu (Esc), goes to **Multiplayer** and clicks **Host a room**. A 5-letter code appears.
+2. Everyone else opens **Multiplayer**, types the code and clicks **Join**. They start right beside the host, flying as the host is (or parked beside them on the ground).
+3. Set your name on the same page.
+
+You can also start straight into a room: `--join K7Q2M` (or `--host`) on the command line, or `?join=K7Q2M` on the Web Edition's address. `--name Cade` / `&name=Cade` sets your name.
+
+**How it works** (`net.rs`): there is no game server. Every player connects to three free public MQTT brokers (message relays: EMQX, HiveMQ, Mosquitto) over secure WebSockets, subscribes to the room's topic, and sends its aircraft's state ten times a second to all three. The same message arriving through two relays counts once, so players meet as long as any one relay works for both. Each report is stamped with the sender's clock, and other aircraft are played back about a quarter of a second behind, gliding between reports, so they move smoothly even when reports arrive unevenly. A crash is sent as its own message, and everyone runs the game's own crash for it (fireball, fire simulation, breaking wreck, crater, buildings knocked down). The host also sends the time of day and weather.
+
+Rooms are public: anyone with the code can join, and positions and names go through the public relays.
+
 # How it works
 
 **Everything is Rust** (no game engine): [wgpu](https://wgpu.rs) for the graphics, winit for the window and input, egui for the menus and HUD.
@@ -78,7 +94,7 @@ The first run on Windows or Mac builds the game from this source code, which tak
 
 **The rest:** `weather.rs` and `live.rs` (weather and real traffic), `traffic.rs` and `cars.rs` (airport and road traffic), `audio.rs` (the synthesizer), `menu.rs` (globe and menus), `career.rs` (logbook), `cockpit.rs` and `gauges.rs` (instruments), `plat.rs` (what differs between the desktop and the browser).
 
-**Saved on your computer:** downloaded map tiles in your user cache folder (`fablegame`), and the career logbook in `career.txt` next to the game.
+**Saved on your computer:** downloaded map tiles in your user cache folder (`fablegame`), and next to the game the career logbook (`career.txt`), graphics settings (`settings.txt`) and your multiplayer name (`mp_name.txt`).
 
 # Command-line options
 
@@ -95,6 +111,7 @@ The first run on Windows or Mac builds the game from this source code, which tak
 | `--cockpit` | start in the cockpit view |
 | `--offline` | use only the map cache (no downloads) |
 | `--mute`, `--no-hud`, `--no-vsync` | sound, HUD and vsync off |
+| `--host`, `--join K7Q2M`, `--name Cade` | multiplayer: make a room, join one, your name |
 | `--help` | the full list |
 
 # Compiling

@@ -248,6 +248,7 @@ pub const GLASS: Color32 = Color32::from_rgba_premultiplied(5, 8, 12, 140);
 /// game; the pause menu (Esc) stops it.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Page {
+    Multiplayer,
     Flight,
     Places,
     Weather,
@@ -258,7 +259,7 @@ pub enum Page {
 
 impl Page {
     pub const INFO: [Page; 3] = [Page::Flight, Page::Places, Page::Weather];
-    pub const PAUSE: [Page; 3] = [Page::Game, Page::Settings, Page::Controls];
+    pub const PAUSE: [Page; 4] = [Page::Game, Page::Multiplayer, Page::Settings, Page::Controls];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -268,6 +269,7 @@ impl Page {
             Page::Game => "Game",
             Page::Settings => "Settings",
             Page::Controls => "Controls",
+            Page::Multiplayer => "Multiplayer",
         }
     }
 
