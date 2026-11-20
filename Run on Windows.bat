@@ -1,7 +1,7 @@
 @echo off
-rem Microslop Flight Simulator on Windows: builds the game the first time
+rem Openflight on Windows: builds the game the first time
 rem (several minutes), then starts it. Double-click this file.
-title Microslop Flight Simulator
+title Openflight
 cd /d "%~dp0"
 if exist "%USERPROFILE%\.cargo\bin" set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 where cargo >nul 2>nul
@@ -14,7 +14,7 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-echo Starting Microslop Flight Simulator. The first time, building it takes several minutes...
+echo Starting Openflight. The first time, building it takes several minutes...
 cargo run --release
 if errorlevel 1 (
   echo.

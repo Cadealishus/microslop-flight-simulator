@@ -1,4 +1,4 @@
-Microslop Flight Simulator - Mac
+Openflight - Mac
 
 1. Install Rust once: open Terminal and follow https://rustup.rs
 2. Double-click "Run on Mac.command" in this folder.

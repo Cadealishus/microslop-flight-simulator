@@ -13,6 +13,10 @@
 //!
 //! What is sent is visible to anyone who listens on that topic of the public
 //! broker: positions and a player name, nothing else.
+//!
+//! Outside a room, a game that is flying (not at the menus) says only "one
+//! more pilot up", every few seconds, on a topic of its own: three bytes, no
+//! position and no name, under a random id. The website counts these.
 
 use glam::{DQuat, DVec3};
 use std::collections::BTreeMap;
@@ -26,6 +30,10 @@ const RATE: f64 = 10.0;
 const CONNECT_S: f64 = 8.0;
 /// A player not heard from for this long has left.
 const GONE_S: f64 = 12.0;
+/// Outside a room: "flying" this often (the website forgets a pilot after 15 s).
+const SOLO_EVERY: f64 = 5.0;
+/// Where those go: a room code is letters and digits only, so no room can be called this.
+const SOLO_ROOM: &str = "_solo";
 const CODE_CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 /// The host's sky, as everyone takes it.
@@ -343,6 +351,9 @@ pub struct Net {
     booms: u16,
     /// the last crash heard from each player (it comes through every relay, and more than once)
     heard: BTreeMap<u32, u16>,
+    /// outside a room: one relay, for the "flying" note, and when it is next due
+    solo: Option<Conn>,
+    solo_at: f64,
 }
 
 /// What this player sends; the game fills it in each frame.
@@ -351,7 +362,7 @@ pub type Mine = State;
 impl Net {
     pub fn new(seed: u64) -> Self {
         let me = (seed ^ (seed >> 29) ^ 0x9e37_79b9) as u32 | 1;
-        Self { me, name: format!("Pilot {}", me % 10_000), room: None, hosting: false, peers: BTreeMap::new(), sky: None, conns: Vec::new(), t: 0.0, send_at: 0.0, seq: 0, host_seen: false, boom: None, booms: 0, heard: BTreeMap::new(), last_wall: None }
+        Self { me, name: format!("Pilot {}", me % 10_000), room: None, hosting: false, peers: BTreeMap::new(), sky: None, conns: Vec::new(), t: 0.0, send_at: 0.0, seq: 0, host_seen: false, boom: None, booms: 0, heard: BTreeMap::new(), last_wall: None, solo: None, solo_at: 0.0 }
     }
 
     /// Make a room; returns its code.
@@ -369,6 +380,13 @@ impl Net {
         code
     }
 
+    /// Make a room with a code chosen beforehand (the website hands one out with the link).
+    pub fn host_code(&mut self, code: &str) -> String {
+        let code: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()).take(8).collect();
+        self.enter(code.clone(), true);
+        code
+    }
+
     /// Join a room by its code (spaces and case don't matter).
     pub fn join(&mut self, code: &str) -> bool {
         let code: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()).collect();
@@ -381,6 +399,9 @@ impl Net {
 
     fn enter(&mut self, code: String, host: bool) {
         self.leave();
+        if let Some(l) = self.solo.take().and_then(|c| c.link) {
+            l.close();
+        }
         self.room = Some(code);
         self.hosting = host;
         self.host_seen = host;
@@ -432,11 +453,76 @@ impl Net {
         }
     }
 
+    /// Outside a room: keep one relay (the first that answers) and, while
+    /// flying, tell it so every few seconds. Nothing is listened to.
+    fn tick_solo(&mut self, mine: &Mine) {
+        let t = self.t;
+        let c = self.solo.get_or_insert_with(|| Conn { broker: 0, link: None, phase: Phase::Retry(0.0), buf: Vec::new(), ping_at: 0.0 });
+        // gone or silent: try the next relay in a while
+        let next = |c: &mut Conn, wait: f64| {
+            if let Some(l) = c.link.take() {
+                l.close();
+            }
+            c.buf.clear();
+            c.broker = (c.broker + 1) % BROKERS.len();
+            c.phase = Phase::Retry(t + wait);
+        };
+        match c.phase {
+            Phase::Retry(at) if t >= at => {
+                c.link = Some(link::Link::open(BROKERS[c.broker]));
+                c.buf.clear();
+                c.phase = Phase::Connecting(t);
+            }
+            Phase::Connecting(since) if t - since > CONNECT_S => next(c, 2.0),
+            _ => {}
+        }
+        for e in c.link.as_ref().map(|l| l.poll()).unwrap_or_default() {
+            match e {
+                link::Ev::Open => {
+                    if let Some(l) = &c.link {
+                        l.send(mqtt::connect(&format!("msfs{:08x}s", self.me)));
+                    }
+                }
+                link::Ev::Data(d) => c.buf.extend_from_slice(&d),
+                link::Ev::Closed(_) => {
+                    next(c, 5.0);
+                    return;
+                }
+            }
+        }
+        while let Some((kind, body, n)) = mqtt::next_packet(&c.buf).map(|(k, b, n)| (k, b.to_vec(), n)) {
+            c.buf.drain(..n);
+            if kind >> 4 == 2 {
+                if body.get(1) == Some(&0) {
+                    c.phase = Phase::Live;
+                    c.ping_at = t + 30.0;
+                    self.solo_at = t;
+                } else {
+                    next(c, 5.0);
+                    return;
+                }
+            }
+        }
+        if let (Some(l), Phase::Live) = (&c.link, c.phase) {
+            if !mine.away && t >= self.solo_at {
+                self.solo_at = t + SOLO_EVERY;
+                c.ping_at = t + 30.0;
+                l.send(mqtt::publish(&format!("{TOPIC}/{SOLO_ROOM}/{}", self.me), &[b'M', 4, 1]));
+            } else if t >= c.ping_at {
+                c.ping_at = t + 30.0;
+                l.send(vec![0xC0, 0]);
+            }
+        }
+    }
+
     /// Each frame: keeps the connections, sends ours, takes theirs.
     pub fn tick(&mut self, dt: f64, mine: &Mine) -> Vec<Event> {
         let mut ev = Vec::new();
         self.t += dt;
-        let Some(room) = self.room.clone() else { return ev };
+        let Some(room) = self.room.clone() else {
+            self.tick_solo(mine);
+            return ev;
+        };
         let topic = format!("{TOPIC}/{room}");
         let t = self.t;
         let send = t >= self.send_at;

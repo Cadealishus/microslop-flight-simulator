@@ -89,6 +89,8 @@ enum PauseAct {
 
 use crash::Crash;
 use damage::Tear;
+static NO_PLANE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 use glam::{DMat4, DQuat, DVec2, DVec3, Mat4, Vec2, Vec3};
 use padui::Hint;
 use plane::{Controls, Plane};
@@ -182,6 +184,7 @@ struct Args {
     /// starting height above the ground, instead of `alt` above sea level
     agl: Option<f64>,
     heading: f64,
+    bank: f64,
     place: Option<String>,
     max_zoom: u8,
     hour: f64,
@@ -223,6 +226,7 @@ struct Args {
     mute: bool,
     /// multiplayer: make a room, join one by its code, the name to show
     mp_host: bool,
+    mp_host_code: Option<String>,
     mp_join: Option<String>,
     mp_name: Option<String>,
     /// start on the globe menu (default unless a place or scripted run is given)
@@ -251,6 +255,7 @@ fn parse_args() -> Args {
         alt: None,
         agl: None,
         heading: 95.0,
+        bank: 0.0,
         place: None,
         max_zoom: 17,
         hour: 16.6,
@@ -281,6 +286,7 @@ fn parse_args() -> Args {
         fov: None,
         mute: false,
         mp_host: false,
+        mp_host_code: None,
         mp_join: None,
         mp_name: None,
         menu: None,
@@ -355,6 +361,12 @@ fn parse_args() -> Args {
             "--alt" => a.alt = num(&v, i),
             "--agl" => a.agl = num(&v, i),
             "--heading" => a.heading = num(&v, i).unwrap_or(a.heading),
+            "--no-plane" => {
+                // leave the player's aircraft out of the picture: a clean plate for cut-outs
+                NO_PLANE.store(true, std::sync::atomic::Ordering::Relaxed);
+                used = 1;
+            }
+            "--bank" => a.bank = num(&v, i).unwrap_or(0.0),
             "--place" => {
                 a.place = v.get(i + 1).cloned();
                 a.menu.get_or_insert(false);
@@ -443,8 +455,10 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--host" => {
+                // optionally with the room's code (a link made by the website: ?host=K7Q2M)
                 a.mp_host = true;
-                used = 1;
+                a.mp_host_code = v.get(i + 1).filter(|c| (4..=8).contains(&c.len()) && c.chars().all(|ch| ch.is_ascii_alphanumeric())).cloned();
+                used = if a.mp_host_code.is_some() { 2 } else { 1 };
             }
             "--join" => a.mp_join = v.get(i + 1).cloned(),
             "--name" => a.mp_name = v.get(i + 1).cloned(),
@@ -774,6 +788,10 @@ impl Game {
         let alt = args.alt.unwrap_or_else(|| ground_elev(&src, lat, lon) + args.agl.unwrap_or(450.0));
         let spec = args.aircraft.as_deref().and_then(aircraft::by_key).unwrap_or(aircraft::ALL[0]);
         let mut plane = Plane::spawn(spec, lat.to_radians(), lon.to_radians(), alt, args.heading.to_radians(), spec.cruise);
+        if args.bank != 0.0 {
+            // roll about the nose (forward is -Z), positive banks right; for scripted screenshots
+            plane.rot = plane.rot * DQuat::from_rotation_z(-args.bank.to_radians());
+        }
         if let Some(spec) = &args.damage {
             plane.dmg.apply_spec(spec);
         }
@@ -886,7 +904,10 @@ impl Game {
         if let Some(code) = &args.mp_join {
             g.net.join(code);
         } else if args.mp_host {
-            let code = g.net.host();
+            let code = match &args.mp_host_code {
+                Some(c) => g.net.host_code(c),
+                None => g.net.host(),
+            };
             log::info!("multiplayer: hosting room {code}");
         }
         // With --menu, an --airport is chosen on the globe rather than flown from.
@@ -2824,7 +2845,7 @@ impl Game {
                     airframe::Vis::SlowProp => blur >= 1.0,
                     airframe::Vis::FastProp => blur <= 0.0,
                 };
-                if hide || dm.hidden(p) {
+                if hide || dm.hidden(p) || NO_PLANE.load(std::sync::atomic::Ordering::Relaxed) {
                     continue;
                 }
                 let tears = dm.tears_for(p);
@@ -3042,13 +3063,13 @@ impl Game {
         };
         poly(&[[0.0, 18.0], [54.0, 0.0], [22.0, 28.0]], BLUE);
         poly(&[[54.0, 0.0], [32.0, 50.0], [22.0, 28.0]], DEEP);
-        poly(&[[66.0, 66.0], [400.0, 66.0], [392.0, 72.0], [58.0, 72.0]], BLUE);
-        poly(&[[110.0, 76.0], [360.0, 76.0], [354.0, 79.0], [104.0, 79.0]], DEEP);
+        poly(&[[66.0, 66.0], [330.0, 66.0], [322.0, 72.0], [58.0, 72.0]], BLUE);
+        poly(&[[110.0, 76.0], [292.0, 76.0], [286.0, 79.0], [104.0, 79.0]], DEEP);
         egui::Area::new(egui::Id::new("home_logo")).fixed_pos(o + vec2(68.0, -12.0) * s).interactable(false).show(ctx, |ui| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             ui.spacing_mut().item_spacing.y = -6.0 * s;
-            ui.label(RichText::new("MICROSLOP").size(19.0 * s).italics().color(Color32::WHITE));
-            ui.label(RichText::new("Flight Simulator").size(44.0 * s).italics().color(Color32::WHITE));
+            ui.label(RichText::new("FLIGHT SIMULATOR").size(15.0 * s).italics().color(Color32::from_rgb(150, 200, 255)));
+            ui.label(RichText::new("Openflight").size(50.0 * s).italics().strong().color(Color32::WHITE));
         });
 
         let mut clicked: Option<usize> = None;
@@ -3121,8 +3142,8 @@ impl Game {
             let who = Rect::from_min_size(pos2(ctl.left() - 10.0 - 236.0, ctl.top()), vec2(236.0, 40.0));
             pill(who, false);
             p.circle_filled(who.left_center() + vec2(20.0, 0.0), 14.0, DEEP);
-            p.text(who.left_center() + vec2(20.0, 0.0), Align2::CENTER_CENTER, "M", FontId::proportional(14.5), Color32::WHITE);
-            p.text(who.left_top() + vec2(42.0, 4.0), Align2::LEFT_TOP, "MicroslopUser#8421", FontId::proportional(13.5), Color32::WHITE);
+            p.text(who.left_center() + vec2(20.0, 0.0), Align2::CENTER_CENTER, self.net.name.chars().next().unwrap_or('P').to_uppercase().to_string(), FontId::proportional(14.5), Color32::WHITE);
+            p.text(who.left_top() + vec2(42.0, 4.0), Align2::LEFT_TOP, &self.net.name, FontId::proportional(13.5), Color32::WHITE);
             p.text(who.left_top() + vec2(42.0, 21.5), Align2::LEFT_TOP, format!("{}  \u{b7}  {:.0} pts", self.career.rank().0, self.career.points()), FontId::proportional(11.0), BLUE);
             let r = ui.allocate_rect(ctl, egui::Sense::click());
             pill(ctl, r.hovered());
@@ -3291,7 +3312,7 @@ impl Game {
                     }
                     _ => {
                         const KIND: [&str; 10] = ["Single-engine piston", "Twin turboprop", "Jet trainer", "Carrier fighter", "Carrier fighter", "Ground attack", "Stealth attack", "Airliner", "Freighter", "Military transport"];
-                        ui.label(dim(&format!("Balance: {:.0} Microslop Points. Everything in the hangar is yours.", self.career.points())));
+                        ui.label(dim(&format!("Balance: {:.0} points. Everything in the hangar is yours.", self.career.points())));
                         ui.add_space(6.0);
                         for (i, spec) in aircraft::ALL.iter().enumerate() {
                             card(ui, &mut |ui| {
@@ -3959,7 +3980,7 @@ impl Game {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(RichText::new("PAUSED").size(28.0).strong().color(Color32::WHITE));
-                        ui.label(RichText::new("MICROSLOP FLIGHT SIMULATOR").size(11.5).strong().color(ACCENT));
+                        ui.label(RichText::new("OPENFLIGHT").size(11.5).strong().color(ACCENT));
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.vertical(|ui| {
@@ -4714,6 +4735,11 @@ impl Game {
     fn net_tick(&mut self, dt: f64, in_menu: bool) {
         if self.net.room.is_none() {
             self.others.clear();
+            // solo: only "flying or not" goes out, so the website can count pilots (not for scripted screenshots)
+            if self.shots.is_empty() && self.record.is_none() {
+                let mine = net::State { away: in_menu || self.crashed, ..Default::default() };
+                self.net.tick(dt, &mine);
+            }
             return;
         }
         let p = &self.plane;
@@ -5118,7 +5144,7 @@ impl ApplicationHandler for App {
             use wasm_bindgen::JsCast;
             use winit::platform::web::WindowAttributesExtWebSys;
             let canvas = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("game")).and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok());
-            let attrs = Window::default_attributes().with_title("Microslop Flight Simulator").with_canvas(canvas).with_prevent_default(true).with_focusable(true);
+            let attrs = Window::default_attributes().with_title("Openflight").with_canvas(canvas).with_prevent_default(true).with_focusable(true);
             let window = Arc::new(el.create_window(attrs).expect("window"));
             let cell = std::rc::Rc::new(std::cell::RefCell::new(None));
             let (w, c) = (window.clone(), cell.clone());
@@ -5132,7 +5158,7 @@ impl ApplicationHandler for App {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let attrs = Window::default_attributes().with_title("Microslop Flight Simulator").with_inner_size(winit::dpi::PhysicalSize::new(self.args.size.0, self.args.size.1));
+            let attrs = Window::default_attributes().with_title("Openflight").with_inner_size(winit::dpi::PhysicalSize::new(self.args.size.0, self.args.size.1));
             let window = Arc::new(el.create_window(attrs).expect("window"));
             let started = pollster::block_on(Renderer::new(window.clone(), self.args.vsync)).and_then(|r| Game::new(window, &self.args, r));
             match started {

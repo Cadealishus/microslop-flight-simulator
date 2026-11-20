@@ -1,4 +1,4 @@
-Microslop Flight Simulator - Windows
+Openflight - Windows
 
 1. Install Rust once: download and run rustup-init.exe from https://rustup.rs
    If it asks to install the Visual Studio C++ build tools, say yes.

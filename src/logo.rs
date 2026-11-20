@@ -1,10 +1,10 @@
-//! The "FABLE FLIGHT" title over the start screen: no box behind it, drawn
+//! The "OPENFLIGHT" title over the start screen: no box behind it, drawn
 //! as the inverse of whatever colour is under each pixel (see `fs_blit` in
 //! post.wgsl), so it reads against space, the planet and its glow alike.
 //! This rasterises its coverage mask, one byte per screen pixel.
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 
-pub const TEXT: &str = "MICROSLOP FLIGHT SIMULATOR";
+pub const TEXT: &str = "OPENFLIGHT";
 
 /// A bold system sans for the title (the UI borrows the system's fonts too).
 pub fn find_font() -> Option<Vec<u8>> {

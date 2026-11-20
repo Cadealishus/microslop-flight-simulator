@@ -1,5 +1,5 @@
 #!/bin/bash
-# Microslop Flight Simulator on a Mac: builds the game the first time
+# Openflight on a Mac: builds the game the first time
 # (several minutes), then starts it. Double-click this file, or run it
 # from Terminal.
 cd "$(dirname "$0")"
