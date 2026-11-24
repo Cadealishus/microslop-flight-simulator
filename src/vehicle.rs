@@ -64,7 +64,7 @@ pub static KINDS: [Kind; 2] = [
         mass: 2700.0,
         power: 522_000.0,
         vmax: 58.0,
-        cg: 0.9,
+        cg: 0.75,
         freq: 1.25,
         zeta: 0.32,
         travel: 0.3,
@@ -150,7 +150,7 @@ fn load(bytes: &[u8]) -> Shape {
     let n = u32_(&take(4)) as usize;
     let mut parts = Vec::new();
     let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-    for k in 0..n {
+    for _ in 0..n {
         let h = take(16);
         let hub = Vec3::new(f32_(&h[0..]), f32_(&h[4..]), f32_(&h[8..]));
         let r = f32_(&h[12..]);
@@ -174,7 +174,6 @@ fn load(bytes: &[u8]) -> Shape {
             lo = lo.min(p);
             hi = hi.max(p);
         }
-        let _ = k;
         parts.push(Part { v, i, hub, r });
     }
     let mut it = parts.into_iter();
@@ -211,13 +210,34 @@ struct Skin {
     v: Vec<PartVertex>,
     rest: Vec<Vec3>,
     i: Vec<u32>,
-    mesh: usize,
-    dirty: bool,
+    /// on the GPU once first drawn
+    mesh: Option<usize>,
+    /// the vertices moved since the last upload (first, end), and whether the indices changed
+    dirty: Option<(usize, usize)>,
     idx_dirty: bool,
 }
 impl Skin {
-    fn new(p: &Part, r: &mut Renderer) -> Skin {
-        Skin { v: p.v.clone(), rest: p.v.iter().map(|v| Vec3::from(v.pos)).collect(), i: p.i.clone(), mesh: r.add_dynamic_mesh(&p.v, &p.i), dirty: false, idx_dirty: false }
+    fn new(p: &Part) -> Skin {
+        Skin { v: p.v.clone(), rest: p.v.iter().map(|v| Vec3::from(v.pos)).collect(), i: p.i.clone(), mesh: None, dirty: None, idx_dirty: false }
+    }
+    fn upload(&mut self, r: &mut Renderer) -> usize {
+        match self.mesh {
+            None => {
+                let m = r.add_dynamic_mesh(&self.v, &self.i);
+                self.mesh = Some(m);
+                self.dirty = None;
+                self.idx_dirty = false;
+                m
+            }
+            Some(m) => {
+                if let Some((a, b)) = self.dirty.take() {
+                    // Only the stretch of vertices that moved.
+                    r.write_mesh_range(m, a, &self.v[a..b], if self.idx_dirty { Some(&self.i) } else { None });
+                    self.idx_dirty = false;
+                }
+                m
+            }
+        }
     }
 }
 
@@ -257,6 +277,8 @@ pub struct Car {
     time: f64,
     pub scrape: f32,
     dent_cool: f64,
+    /// how long it has been lying on its side or roof, nearly still
+    stuck: f64,
 }
 
 /// Every car in the world, and the models they share.
@@ -265,27 +287,24 @@ pub struct Garage {
     shapes: Vec<Option<Shape>>,
     wheel_mesh: Vec<Option<[usize; 4]>>,
     pub cars: Vec<Car>,
-    pub rng_seed: u32,
 }
 
 impl Garage {
-    fn shape(&mut self, k: usize, r: &mut Renderer) -> &Shape {
+    fn shape(&mut self, k: usize) -> &Shape {
         if self.shapes.len() < KINDS.len() {
             self.shapes.resize_with(KINDS.len(), || None);
             self.wheel_mesh.resize(KINDS.len(), None);
         }
         if self.shapes[k].is_none() {
-            let s = load(KINDS[k].model);
-            self.wheel_mesh[k] = Some([0, 1, 2, 3].map(|w| r.add_mesh(&s.wheels[w].v, &s.wheels[w].i)));
-            self.shapes[k] = Some(s);
+            self.shapes[k] = Some(load(KINDS[k].model));
         }
         self.shapes[k].as_ref().unwrap()
     }
 
     /// Put a new car of kind `k` on the ground at `at`, its nose to `heading` (radians from north).
-    pub fn spawn(&mut self, k: usize, at: DVec3, heading: f64, world: &World, r: &mut Renderer) -> usize {
+    pub fn spawn(&mut self, k: usize, at: DVec3, heading: f64, world: &World) -> usize {
         let kind = &KINDS[k];
-        let s = self.shape(k, r);
+        let s = self.shape(k);
         let (e, n, u) = geo::enu(at);
         let fwd = n * heading.cos() + e * heading.sin();
         let right = fwd.cross(u);
@@ -314,7 +333,7 @@ impl Garage {
         }
         let g = ground(world, at).unwrap_or(geo::pos_to_lla(at).2);
         let pos = geo::lla_to_pos(geo::pos_to_lla(at).0, geo::pos_to_lla(at).1, g) + u * (kind.cg + 0.05);
-        let (body, glass) = (Skin::new(&s.body, r), Skin::new(&s.glass, r));
+        let (body, glass) = (Skin::new(&s.body), Skin::new(&s.glass));
         let rest = kind.travel + sag;
         self.cars.push(Car {
             kind,
@@ -346,6 +365,7 @@ impl Garage {
             time: 0.0,
             scrape: 0.0,
             dent_cool: 0.0,
+            stuck: 0.0,
         });
         self.cars.len() - 1
     }
@@ -368,22 +388,21 @@ impl Garage {
 
     /// Upload the dents and draw every car.
     pub fn draw(&mut self, cam: DVec3, r: &mut Renderer, objs: &mut Vec<DrawObj>) {
-        for c in &mut self.cars {
-            for s in [&mut c.body, &mut c.glass] {
-                if s.dirty {
-                    r.write_mesh(s.mesh, &s.v, if s.idx_dirty { Some(&s.i) } else { None });
-                    s.dirty = false;
-                    s.idx_dirty = false;
-                }
+        for c in &self.cars {
+            let k = c.kind_index();
+            if self.wheel_mesh[k].is_none() {
+                let s = self.shapes[k].as_ref().unwrap();
+                self.wheel_mesh[k] = Some([0, 1, 2, 3].map(|w| r.add_mesh(&s.wheels[w].v, &s.wheels[w].i)));
             }
         }
-        for (ci, c) in self.cars.iter().enumerate() {
-            let Some(wm) = self.wheel_mesh.get(c.kind_index()).copied().flatten() else { continue };
+        for (ci, c) in self.cars.iter_mut().enumerate() {
+            let wm = self.wheel_mesh[c.kind_index()].unwrap();
+            let (body, glass) = (c.body.upload(r), c.glass.upload(r));
             let origin = c.pos - c.rot * DVec3::new(0.0, c.kind.cg, 0.0);
             let base = Mat4::from_rotation_translation(c.rot.as_quat(), (origin - cam).as_vec3());
             let o = DrawObj { glow: [0.0, SHADER_KIND, 0.0, ci as f32 * 0.37], cast: 0b11, ..DrawObj::DEFAULT };
-            objs.push(DrawObj { mesh: c.body.mesh, model: base, ..o });
-            objs.push(DrawObj { mesh: c.glass.mesh, model: base, glass: true, ..o });
+            objs.push(DrawObj { mesh: body, model: base, ..o });
+            objs.push(DrawObj { mesh: glass, model: base, glass: true, ..o });
             for w in 0..4 {
                 if c.lost[w] {
                     continue;
@@ -482,7 +501,7 @@ impl Car {
         force -= self.vel * (cda * v2.sqrt()) * if water { 25.0 } else { 1.0 };
         force -= self.up() * kind.down * v2;
         // Steering, lighter at speed.
-        let lock = kind.steer / (1.0 + v2.sqrt() / 22.0);
+        let lock = kind.steer / (1.0 + v2.sqrt() / 12.0);
         let want = d.steer * lock;
         self.steer += (want - self.steer).clamp(-2.4 * h, 2.4 * h);
         let fwd_speed = self.vel.dot(self.forward());
@@ -525,6 +544,11 @@ impl Car {
             let contact = top + bdown * (len + self.radius[w]);
             let r = contact - self.pos;
             let mut nf = self.k * (self.rest - len) - self.c * rate;
+            // The anti-roll bar: the wheel opposite pressed further in pushes this one down too.
+            let other = w ^ 1;
+            if self.grounded[other] && !self.lost[other] {
+                nf += self.k * 1.1 * (self.len[other] - len);
+            }
             // The bump stop.
             if len < 0.03 {
                 nf += self.k * 8.0 * (0.03 - len);
@@ -539,7 +563,9 @@ impl Car {
             let v = self.vel + self.w.cross(r);
             let (vl, vs) = (v.dot(wf), v.dot(wr));
             let rear_locked = d.handbrake && w >= 2;
-            let grip = mu * nf * if rear_locked { 0.55 } else { 1.0 };
+            // Tyres grip less per newton the harder they are pressed (which is what keeps cars on their wheels).
+            let load = (nf / (share * 9.81) - 1.0).clamp(-1.0, 3.0);
+            let grip = mu * nf * (1.0 - 0.14 * load) * if rear_locked { 0.55 } else { 1.0 };
             let slip = vs.atan2(vl.abs() + 0.8);
             let mut fs = -grip * (slip * 7.0).tanh();
             // Slow: never more than stops the slide this step.
@@ -566,7 +592,7 @@ impl Car {
             force += f;
             torque += r.cross(f);
             // The wheel turns with the ground (stopped if locked, spinning up if the drive slips).
-            self.spin_w[w] = if rear_locked || (brake > 0.9 && vl.abs() < 25.0 && false) { 0.0 } else { vl / self.radius[w] + if d.throttle > 0.9 && fwd_speed < 8.0 && w >= 2 { 18.0 } else { 0.0 } };
+            self.spin_w[w] = if rear_locked { 0.0 } else { vl / self.radius[w] + if d.throttle > 0.9 && fwd_speed < 8.0 && w >= 2 { 18.0 } else { 0.0 } };
             self.spin[w] += self.spin_w[w] * h;
             // A slide leaves dust or rubber smoke.
             if (vs.abs() > 6.0 || (rear_locked && vl.abs() > 6.0)) && (self.time * 30.0).fract() < h * 30.0 {
@@ -603,6 +629,21 @@ impl Car {
             if vn > 3.5 {
                 self.dent(p, normal, vn, HitKind::Ground, hits);
             }
+        }
+        // On its roof or side and nearly still for a while: back onto its wheels (the marshals' job).
+        if self.up().dot(up) < 0.3 && self.speed() < 1.0 {
+            self.stuck += h;
+        } else {
+            self.stuck = 0.0;
+        }
+        if self.stuck > 2.5 {
+            let f = self.forward();
+            let flat = (f - up * f.dot(up)).normalize_or(self.right().cross(up));
+            self.rot = DQuat::from_mat3(&DMat3::from_cols(flat.cross(up), up, -flat));
+            self.pos += up * 1.0;
+            self.w = DVec3::ZERO;
+            self.vel = DVec3::ZERO;
+            self.stuck = 0.0;
         }
         // The hull against buildings.
         if self.time - self.near_t > 0.25 || (self.pos - self.near_o).length() > 25.0 {
@@ -668,7 +709,7 @@ impl Car {
         self.damage = (self.damage + (dv as f64 / 60.0).powi(2)).min(1.0);
         let mut broke = 0;
         for (si, s) in [&mut self.body, &mut self.glass].into_iter().enumerate() {
-            let mut touched = false;
+            let mut touched: Option<(usize, usize)> = None;
             for (k, v) in s.v.iter_mut().enumerate() {
                 let q = Vec3::from(v.pos);
                 let dist = q.distance(p);
@@ -691,10 +732,10 @@ impl Car {
                 // Crinkled panels catch the light unevenly.
                 let nrm = (Vec3::from(v.nrm) + side * fall * (depth * 4.0).min(1.2)).normalize_or_zero();
                 v.nrm = nrm.into();
-                touched = true;
+                touched = Some(touched.map_or((k, k + 1), |(a, b)| (a.min(k), b.max(k + 1))));
             }
-            if touched {
-                s.dirty = true;
+            if let Some((a, b)) = touched {
+                s.dirty = Some(s.dirty.map_or((a, b), |(x, y)| (x.min(a), y.max(b))));
             }
             // Glass near a hard hit bursts.
             if si == 1 && dv > 7.0 {
@@ -712,7 +753,7 @@ impl Car {
                 }
                 if broke > 0 {
                     s.idx_dirty = true;
-                    s.dirty = true;
+                    s.dirty = Some(s.dirty.unwrap_or((0, 0)));
                 }
             }
         }
@@ -854,5 +895,96 @@ pub fn particles(hits: &[Hit], rng: &mut Rng, out: &mut Vec<(DVec3, Particle)>) 
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn flat_world() -> World {
+        let dir = std::env::temp_dir().join("openflight-test-cache");
+        let src = Arc::new(crate::sources::Sources::new(crate::fetch::Fetcher::new(dir, true), String::new()));
+        let mut w = World::new(crate::sources::Loader::new(src, 0), 14);
+        w.flat = Some(0.0);
+        w
+    }
+    fn run(g: &mut Garage, w: &World, secs: f64, d: Drive) -> Vec<Hit> {
+        let mut hits = Vec::new();
+        for _ in 0..(secs * 120.0) as usize {
+            g.step(1.0 / 120.0, Some(0), d, w, &mut hits);
+        }
+        hits
+    }
+    fn agl(c: &Car) -> f64 {
+        c.origin().length() - geo::R
+    }
+
+    #[test]
+    fn settles_accelerates_turns_and_stops() {
+        let w = flat_world();
+        for k in 0..KINDS.len() {
+            let mut g = Garage::default();
+            g.spawn(k, geo::lla_to_pos(0.6, -2.1, 0.0), 0.0, &w);
+            run(&mut g, &w, 3.0, Drive::default());
+            let c = &g.cars[0];
+            assert!(c.grounded.iter().all(|x| *x), "{}: not on its wheels", c.kind.key);
+            assert!(agl(c).abs() < 0.08, "{}: rests at {:.3} m", c.kind.key, agl(c));
+            assert!(c.speed() < 0.05, "{}: creeps at {:.3} m/s", c.kind.key, c.speed());
+            run(&mut g, &w, 4.0, Drive { throttle: 1.0, ..Default::default() });
+            let v = g.cars[0].vel.dot(g.cars[0].forward());
+            println!("{}: {:.1} m/s after 4 s", KINDS[k].key, v);
+            assert!(v > 15.0 && v < 46.0, "{}: {v:.1} m/s after 4 s full throttle", KINDS[k].key);
+            let h0 = g.cars[0].forward();
+            run(&mut g, &w, 2.0, Drive { throttle: 0.3, steer: 1.0, ..Default::default() });
+            let c = &g.cars[0];
+            let turned = h0.angle_between(c.forward()).to_degrees();
+            assert!(turned > 30.0, "{}: turned {turned:.0}°", c.kind.key);
+            assert!(c.up().dot(c.pos.normalize()) > 0.8, "{}: rolled over in a turn", c.kind.key);
+            // Holding S brakes to a stop (and then reverses).
+            let mut slowest = f64::MAX;
+            for _ in 0..6 * 120 {
+                g.step(1.0 / 120.0, Some(0), Drive { throttle: -1.0, ..Default::default() }, &w, &mut Vec::new());
+                slowest = slowest.min(g.cars[0].speed());
+            }
+            assert!(slowest < 1.0, "{}: never slower than {slowest:.1} m/s braking", KINDS[k].key);
+            assert!(g.cars[0].vel.dot(g.cars[0].forward()) < -1.0, "{}: does not reverse", KINDS[k].key);
+        }
+    }
+
+    #[test]
+    fn a_dropped_car_dents_and_survives() {
+        let w = flat_world();
+        let mut g = Garage::default();
+        g.spawn(1, geo::lla_to_pos(0.6, -2.1, 0.0), 0.0, &w);
+        // Drop it on its nose from 6 m.
+        let c = &mut g.cars[0];
+        c.pos += c.pos.normalize() * 6.0;
+        c.rot = c.rot * DQuat::from_rotation_x(-1.2);
+        let hits = run(&mut g, &w, 4.0, Drive::default());
+        let c = &g.cars[0];
+        assert!(hits.iter().any(|h| h.speed > 5.0), "no hard hit");
+        assert!(c.body.dirty.is_some() || c.damage > 0.0, "no dent");
+        assert!(c.pos.is_finite() && agl(c) > -1.0 && agl(c) < 3.0, "ended at {:.2} m", agl(c));
+        let moved = c.body.v.iter().zip(&c.body.rest).map(|(v, r)| (Vec3::from(v.pos) - *r).length()).fold(0.0f32, f32::max);
+        println!("deepest dent {moved:.2} m, damage {:.2}", c.damage);
+        assert!(moved > 0.05 && moved <= 0.76);
+    }
+
+    #[test]
+    fn two_cars_collide() {
+        let w = flat_world();
+        let mut g = Garage::default();
+        let p = geo::lla_to_pos(0.6, -2.1, 0.0);
+        let (_, n, _) = geo::enu(p);
+        g.spawn(0, p, 0.0, &w);
+        g.spawn(1, p + n * 30.0, 0.0, &w);
+        run(&mut g, &w, 1.0, Drive::default());
+        g.cars[0].vel = n * 25.0;
+        let hits = run(&mut g, &w, 3.0, Drive::default());
+        assert!(hits.iter().any(|h| h.kind == HitKind::Car), "no crash");
+        assert!(g.cars[1].vel.dot(n) > 2.0 || (g.cars[1].pos - (p + n * 30.0)).length() > 2.0, "the struck car did not move");
+        assert!((g.cars[0].pos - g.cars[1].pos).length() > 2.5, "they went through each other");
     }
 }

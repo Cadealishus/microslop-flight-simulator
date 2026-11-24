@@ -4453,7 +4453,30 @@ impl Game {
             if self.info_open {
                 self.info_panel(ctx, &mut act, lat.to_degrees(), lon.to_degrees(), local, speed, alt, agl, hdg);
             }
-            if self.show_hud {
+            if self.show_hud && self.seat != Seat::Plane {
+                // On the road or on foot: a speedometer and what the keys do.
+                let (title, v, damage) = match self.seat {
+                    Seat::Car(i) => {
+                        let c = &self.garage.cars[i];
+                        (c.kind.name, c.vel.dot(c.forward()), Some(c.damage))
+                    }
+                    _ => ("On foot", 0.0, None),
+                };
+                egui::Area::new(egui::Id::unique("hud road")).anchor(Align2::LEFT_TOP, [14.0, 14.0]).show(ctx, |ui| {
+                    panel.show(ui, |ui| {
+                        shadow(ui, title.to_string(), 14.0, dim);
+                        if let Some(d) = damage {
+                            shadow(ui, format!("{:>4.0} km/h  {:>4.0} mph", v.abs() * 3.6, v.abs() * 2.23694), 20.0, white);
+                            if v < -0.5 {
+                                shadow(ui, "REVERSE".into(), 14.0, dim);
+                            }
+                            let col = if d > 0.5 { Color32::from_rgb(240, 90, 70) } else { dim };
+                            shadow(ui, format!("DAMAGE {:>3.0}%", d * 100.0), 14.0, col);
+                        }
+                    });
+                });
+            }
+            if self.show_hud && self.seat == Seat::Plane {
                 egui::Area::new(egui::Id::unique("hud")).anchor(Align2::LEFT_TOP, [14.0, 14.0]).show(ctx, |ui| {
                     panel.show(ui, |ui| {
                         shadow(ui, format!("IAS {:>4.0} kt", speed * 1.94384), 20.0, white);
@@ -5223,7 +5246,7 @@ impl Game {
         let f = self.pilot.forward();
         let at = self.pilot.pos + f * 7.0;
         let heading = self.pilot.heading + std::f64::consts::FRAC_PI_2;
-        self.garage.spawn(k, at, heading, &self.world, &mut self.r);
+        self.garage.spawn(k, at, heading, &self.world);
         self.hint(&format!("{} - walk to the driver's door and press Enter", vehicle::KINDS[k].name), 4.0);
     }
 
@@ -5239,7 +5262,7 @@ impl Game {
                 self.pilot.get_out(door, door, face + std::f64::consts::PI, &self.world);
                 self.seat = Seat::Foot;
                 if let Some(k) = vehicle::KINDS.iter().position(|k| k.key == what) {
-                    let i = self.garage.spawn(k, door + self.pilot.forward() * 8.0, self.pilot.heading, &self.world, &mut self.r);
+                    let i = self.garage.spawn(k, door + self.pilot.forward() * 8.0, self.pilot.heading, &self.world);
                     self.seat = Seat::Car(i);
                     self.pilot.shown = false;
                 }

@@ -2223,6 +2223,15 @@ impl Renderer {
             self.queue.write_buffer(&self.meshes[i].ibuf, 0, bytemuck::cast_slice(idx));
         }
     }
+    /// New vertices for part of a dynamic mesh, from vertex `first` on (and, if given, all its indices).
+    pub fn write_mesh_range(&mut self, i: usize, first: usize, verts: &[PartVertex], idx: Option<&[u32]>) {
+        if !verts.is_empty() {
+            self.queue.write_buffer(&self.meshes[i].vbuf, (first * std::mem::size_of::<PartVertex>()) as u64, bytemuck::cast_slice(verts));
+        }
+        if let Some(idx) = idx {
+            self.queue.write_buffer(&self.meshes[i].ibuf, 0, bytemuck::cast_slice(idx));
+        }
+    }
     /// Swap the geometry behind an existing mesh id.
     pub fn replace_mesh(&mut self, i: usize, verts: &[PartVertex], idx: &[u32]) {
         let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(verts), usage: wgpu::BufferUsages::VERTEX });
