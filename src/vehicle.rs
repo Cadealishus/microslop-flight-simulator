@@ -579,8 +579,9 @@ impl Car {
                 fl -= vl.signum() * b.min(stop_l);
             }
             if d.throttle.abs() < 0.05 {
-                // Rolling resistance, and holding still when parked.
-                let hold = if vl.abs() < 0.6 { stop_l } else { 0.015 * nf };
+                // Off the gas: slowing, and holding still when parked.
+                // (Rolling resistance and engine braking, about 0.6 m/s².)
+                let hold = if vl.abs() < 0.6 { stop_l } else { 0.06 * nf };
                 fl -= vl.signum() * hold.min(stop_l);
             }
             let ft = (fl * fl + fs * fs).sqrt();
