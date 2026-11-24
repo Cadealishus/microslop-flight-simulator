@@ -305,6 +305,7 @@ impl Garage {
     pub fn spawn(&mut self, k: usize, at: DVec3, heading: f64, world: &World) -> usize {
         let kind = &KINDS[k];
         let s = self.shape(k);
+        let at = clear_spot(world, at, heading, (s.hi - s.lo).as_dvec3());
         let (e, n, u) = geo::enu(at);
         let fwd = n * heading.cos() + e * heading.sin();
         let right = fwd.cross(u);
@@ -813,6 +814,36 @@ fn collide(a: &mut Car, b: &mut Car, hits: &mut Vec<Hit>) {
             }
         }
     }
+}
+
+/// The nearest place to `at` where a car of `size` facing `heading` stands clear of every building.
+pub fn clear_spot(world: &World, at: DVec3, heading: f64, size: DVec3) -> DVec3 {
+    let (e, n, _) = geo::enu(at);
+    let f = n * heading.cos() + e * heading.sin();
+    let r = f.cross(at.normalize());
+    let clear = |p: DVec3| {
+        [(0.0, 0.0), (0.55, 0.55), (0.55, -0.55), (-0.55, 0.55), (-0.55, -0.55), (0.55, 0.0), (-0.55, 0.0)].iter().all(|(a, b)| {
+            let q = p + f * (a * size.z) + r * (b * size.x);
+            let (la, lo, _) = geo::pos_to_lla(q);
+            world.building(la, lo).is_none()
+        })
+    };
+    if clear(at) {
+        return at;
+    }
+    // Out in rings, 2 m apart.
+    for ring in 1..40 {
+        let rad = ring as f64 * 2.0;
+        let steps = (ring * 8).max(8);
+        for k in 0..steps {
+            let a = k as f64 / steps as f64 * std::f64::consts::TAU;
+            let p = at + (e * a.cos() + n * a.sin()) * rad;
+            if clear(p) {
+                return p;
+            }
+        }
+    }
+    at
 }
 
 /// Inside a ring (flat frame)? Then the way out through the nearest edge and how far.

@@ -2244,6 +2244,10 @@ impl Game {
                     }
                 }
                 for n in self.plane.notes.drain(..) {
+                    // (What happens to the aircraft while nobody is in it is not news.)
+                    if self.seat != Seat::Plane {
+                        continue;
+                    }
                     self.flash.push((n, self.real));
                     if let Some(a) = &self.audio {
                         a.event(audio::Event::Snap(1.0));
@@ -4582,7 +4586,7 @@ impl Game {
                 }
             }
             let report = if self.crashed { Vec::new() } else { p.dmg.report() };
-            if self.show_hud && (!warn.is_empty() || !report.is_empty()) {
+            if self.show_hud && self.seat == Seat::Plane && (!warn.is_empty() || !report.is_empty()) {
                 egui::Area::new(egui::Id::unique("damage")).anchor(Align2::RIGHT_TOP, [if self.info_open { -14.0 - 340.0 - 28.0 - 14.0 } else { -14.0 }, 14.0]).show(ctx, |ui| {
                     panel.show(ui, |ui| {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
@@ -5284,7 +5288,8 @@ impl Game {
                         self.seat = Seat::Foot;
                     }
                 }
-                let back = at - flat * 70.0;
+                let size = DVec3::new(self.spec.span as f64 + 2.0, 3.0, self.spec.span as f64);
+                let back = vehicle::clear_spot(&self.world, at - flat * 70.0, heading, size);
                 let (bl, bo, _) = geo::pos_to_lla(back);
                 let bg = self.world.ground(bl, bo).map(|g| g.h).unwrap_or(g);
                 self.respawn_ground(bl, bo, bg, heading, 0.0);
