@@ -286,7 +286,7 @@ impl Live {
             // satellite composite that is redone every three hours.
             let sh = shared.clone();
             let _ = std::thread::Builder::new().name("live clouds".into()).spawn(move || {
-                let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(30))).user_agent("fablegame-flightsim/0.1").build().into();
+                let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(30))).user_agent("openflight-flightsim/0.1").build().into();
                 loop {
                     let map = get(&agent, CLOUD_MAP).and_then(|b| cloud_map(&b));
                     let ok = map.is_some();
@@ -300,7 +300,7 @@ impl Live {
         }
         let sh = shared.clone();
         let _ = std::thread::Builder::new().name("live".into()).spawn(move || {
-            let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(12))).user_agent("fablegame-flightsim/0.1").build().into();
+            let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(12))).user_agent("openflight-flightsim/0.1").build().into();
             let mut wx_at: Option<(Instant, (f64, f64))> = None;
             let mut ac_at: Option<Instant> = None;
             loop {

@@ -6,14 +6,14 @@
 #   rustup target add wasm32-unknown-unknown
 #   cargo install wasm-bindgen-cli --version 0.2.130 --locked
 Set-Location $PSScriptRoot
-cmd /c "cargo build --release --target wasm32-unknown-unknown --target-dir target\w --bin fablegame 2>&1"
+cmd /c "cargo build --release --target wasm32-unknown-unknown --target-dir target\w --bin openflight 2>&1"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-wasm-bindgen --target web --no-typescript --out-dir web\pkg target\w\wasm32-unknown-unknown\release\fablegame.wasm
+wasm-bindgen --target web --no-typescript --out-dir web\pkg target\w\wasm32-unknown-unknown\release\openflight.wasm
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # The game file in pieces of 18 MB: the CDN mirror (jsDelivr) serves no file
 # over 20 MB, and the page counts its loading percentage by them.
-$wasm = [IO.File]::ReadAllBytes("$PSScriptRoot\web\pkg\fablegame_bg.wasm")
+$wasm = [IO.File]::ReadAllBytes("$PSScriptRoot\web\pkg\openflight_bg.wasm")
 Get-ChildItem web\pkg -Filter "part*.bin" | Remove-Item
 $piece = 18MB
 $names = @()

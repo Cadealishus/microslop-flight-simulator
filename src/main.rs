@@ -58,6 +58,16 @@ mod trees;
 mod ocean;
 mod shore;
 mod world;
+mod vehicle;
+mod pilot;
+
+/// Where the pilot is: flying, on foot, or driving car `n` of the garage.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Seat {
+    Plane,
+    Foot,
+    Car(usize),
+}
 
 #[derive(Copy, Clone, PartialEq)]
 enum Mode {
@@ -205,6 +215,8 @@ struct Args {
     /// record frames + audio to a directory: (dir, start, seconds), fixed 30 fps steps
     record: Option<(PathBuf, f64, f64)>,
     crash_at: Option<f64>,
+    /// start on foot (`foot`) or at the wheel of a car (`raptor`, `countach`)
+    drive: Option<String>,
     /// from this many seconds on, full throttle with the boost key held (the afterburners), for scripted screenshots and recordings
     boost_at: Option<f64>,
     /// game time stands still for this many wall-clock seconds at the start (tiles stream in)
@@ -273,6 +285,7 @@ fn parse_args() -> Args {
         shots: Vec::new(),
         record: None,
         crash_at: None,
+        drive: None,
         boost_at: None,
         hold: 0.0,
         size: (1600, 900),
@@ -392,6 +405,7 @@ fn parse_args() -> Args {
             }
             "--imagery" => a.imagery = v.get(i + 1).cloned().unwrap_or(a.imagery.clone()),
             "--crash-at" => a.crash_at = num(&v, i),
+            "--drive" => a.drive = v.get(i + 1).cloned(),
             "--boost-at" => a.boost_at = num(&v, i),
             "--hold" => a.hold = num(&v, i).unwrap_or(0.0),
             "--damage" => a.damage = v.get(i + 1).cloned(),
@@ -485,7 +499,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("fablegame [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--mute] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("openflight [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--mute] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -575,6 +589,16 @@ struct Game {
     real: f64,
     last: Instant,
     acc: f64,
+    /// on foot and on the road: where the pilot is, where they are getting in,
+    /// the cars, the step of the cars' physics, the camera gliding from where it was
+    seat: Seat,
+    seat_next: Option<Seat>,
+    drive_at: Option<String>,
+    garage: vehicle::Garage,
+    pilot: pilot::Pilot,
+    car_acc: f64,
+    cam_blend: Option<(DVec3, DVec3, f64)>,
+    last_view: (DVec3, DVec3),
     wave_off: DVec2,
     /// the shore distance field's squares (shore.rs)
     shore: shore::Shore,
@@ -760,7 +784,7 @@ fn setting(name: &str) -> Option<u8> {
 
 impl Game {
     fn new(window: Arc<Window>, args: &Args, r: Renderer) -> anyhow::Result<Self> {
-        let cache = crate::plat::cache_dir().unwrap_or_else(|| PathBuf::from(".")).join("fablegame");
+        let cache = crate::plat::cache_dir().unwrap_or_else(|| PathBuf::from(".")).join("openflight");
         let mut r = r;
         // Cached scans load offline too; missing ones keep the procedural layer.
         r.load_ground_photos(fetch::Fetcher::new(cache.clone(), args.offline));
@@ -859,7 +883,7 @@ impl Game {
         let mut g = Self {
             gkey: src.google.key(), gkey_show: false, gm_logo: None, stills: vec![None; aircraft::ALL.len()], window, r, world, src, spec, model, piece_mesh, group_mesh, piece_cut, group_pivots, hangar: Vec::new(), building: Vec::new(), crashed: false, crash: None, crash_real: 0.0, egui_ctx, egui_state, keys: HashSet::new(), drag: false, last_cursor: None,
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { 0 }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
-            utc: (hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], taa: args.taa, prev_plane: Mat4::IDENTITY, plane_box,
+            utc: (hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, seat: Seat::Plane, seat_next: None, drive_at: args.drive.clone(), garage: vehicle::Garage::default(), pilot: pilot::Pilot::new(), car_acc: 0.0, cam_blend: None, last_view: (cam_pos, DVec3::X), wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], taa: args.taa, prev_plane: Mat4::IDENTITY, plane_box,
             frame: 0, fps: 60.0, paused: false, show_help: false, show_hud: !args.no_hud, goto_open: false, goto_text: String::new(), goto_rx: None,
             status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, parking_brake: false, cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
@@ -1498,7 +1522,14 @@ impl Game {
             KeyCode::Escape if self.show_help => self.show_help = false,
             KeyCode::Escape if self.wx.open => self.wx.open = false,
             KeyCode::Escape => self.set_pause_menu(true),
-            KeyCode::KeyR => self.respawn_here(),
+            KeyCode::KeyR => {
+                self.seat = Seat::Plane;
+                self.seat_next = None;
+                self.pilot.shown = false;
+                self.respawn_here();
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter => self.toggle_seat(),
+            KeyCode::Digit1 | KeyCode::Digit2 if self.seat == Seat::Foot && !self.pilot.busy() => self.call_car(if code == KeyCode::Digit1 { 0 } else { 1 }),
             KeyCode::KeyC => self.cam_mode = (self.cam_mode + 1) % 2,
             KeyCode::KeyF if !self.crashed => self.plane.set_flaps(1),
             KeyCode::KeyV if !self.crashed => self.plane.set_flaps(-1),
@@ -2175,10 +2206,14 @@ impl Game {
         }
 
         // Physics at a fixed step.
-        let c = self.controls(dt_real);
+        let mut c = self.controls(dt_real);
+        if self.seat != Seat::Plane {
+            c = Controls { pitch: 0.0, roll: 0.0, yaw: 0.0, throttle: -1.0, brake: true, boost: false, reverse: false };
+        }
         let mut emit = Vec::new();
         let mut femit: Vec<(DVec3, render::Particle)> = Vec::new();
         let (mut scrape_n, mut steps) = (0usize, 0usize);
+        self.ground_tick(dt, in_menu, &mut femit);
         if !self.crashed && !in_menu {
             self.acc += dt;
             let h = 1.0 / 180.0;
@@ -2584,6 +2619,7 @@ impl Game {
             self.cam_pos = cam;
             self.cam_look = self.plane.pos;
         }
+        let (cam, dir, upv) = self.body_camera(cam, dir, upv, dt_real);
         // Never let the camera sink into the ground.
         let (clat, clon, calt) = geo::pos_to_lla(cam);
         let ground = self.world.ground(clat, clon).map(|g| g.h);
@@ -2897,6 +2933,8 @@ impl Game {
         if !in_menu {
             self.sheds.draw(cam, params, &mut objs);
             self.draw_others(cam, params, &mut objs);
+            self.garage.draw(cam, &mut self.r, &mut objs);
+            self.pilot.draw(cam, &mut self.r, &mut objs);
         }
         let mut insts = Vec::new();
         let mut fall = Vec::new();
@@ -5090,6 +5128,252 @@ impl Game {
     }
 }
 
+// ---------------------------------------------------------------- on foot and on the road
+impl Game {
+    /// Where to stand to get into the aircraft, its seat, and which way to face the door.
+    fn plane_door(&self) -> (DVec3, DVec3, f64) {
+        let p = &self.plane;
+        let half = (self.spec.span as f64 * 0.07).max(1.3);
+        let eye = self.spec.eye.as_dvec3();
+        let seat = p.pos + p.rot * eye;
+        let mut door = p.pos + p.rot * DVec3::new(-half - 0.8, 0.0, eye.z);
+        if let Some(cr) = &self.crash {
+            // Out of the wreck and clear of the fire.
+            door = cr.site + p.right() * 9.0;
+        }
+        let g = vehicle::ground(&self.world, door).unwrap_or(geo::pos_to_lla(door).2);
+        let door = door.normalize() * (geo::R + g);
+        let toward = p.pos - door;
+        (door, seat, self.pilot_heading_at(door, toward))
+    }
+    fn pilot_heading_at(&self, at: DVec3, d: DVec3) -> f64 {
+        let (e, n, _) = geo::enu(at);
+        d.dot(e).atan2(d.dot(n))
+    }
+    fn hint(&mut self, s: &str, secs: f64) {
+        self.status = s.into();
+        self.status_until = self.real + secs;
+    }
+
+    /// Enter: out of the aircraft or car, or into the nearest one.
+    fn toggle_seat(&mut self) {
+        if self.pilot.busy() {
+            return;
+        }
+        self.cam_blend = Some((self.last_view.0, self.last_view.1, self.real));
+        match self.seat {
+            Seat::Plane => {
+                let (la, lo, h) = geo::pos_to_lla(self.plane.pos);
+                let agl = h - self.world.ground(la, lo).map(|g| g.h).unwrap_or(h);
+                if !self.crashed && (self.plane.vel.length() > 3.0 || agl > self.spec.eye.y as f64 + 4.0) {
+                    self.cam_blend = None;
+                    self.hint("Stop on the ground to get out", 2.5);
+                    return;
+                }
+                let (door, seat, face) = self.plane_door();
+                self.pilot.get_out(seat, door, face + std::f64::consts::PI, &self.world);
+                self.seat = Seat::Foot;
+                self.cam_mode = 0;
+                self.hint("On foot: W/S walk, A/D turn, Shift run, 1 or 2 to call a car, Enter to get in", 7.0);
+            }
+            Seat::Car(i) => {
+                let c = &self.garage.cars[i];
+                if c.speed() > 4.0 {
+                    self.cam_blend = None;
+                    self.hint("Slow down to get out", 2.0);
+                    return;
+                }
+                let face = self.pilot_heading_at(c.door(), -c.right());
+                let (seat, door) = (c.eye() - c.up() * 0.7, c.door());
+                self.pilot.get_out(seat, door, face, &self.world);
+                self.seat = Seat::Foot;
+                self.cam_mode = 0;
+            }
+            Seat::Foot => {
+                self.cam_blend = None;
+                // The nearest door within a few steps.
+                let me = self.pilot.pos;
+                let mut best: Option<(f64, Seat, DVec3, f64)> = None;
+                for (i, c) in self.garage.cars.iter().enumerate() {
+                    let d = (c.door() - me).length();
+                    if d < 6.0 && best.as_ref().is_none_or(|b| d < b.0) {
+                        best = Some((d, Seat::Car(i), c.door(), self.pilot_heading_at(c.door(), c.right())));
+                    }
+                }
+                if !self.crashed {
+                    let (door, _, face) = self.plane_door();
+                    let d = (door - me).length();
+                    if d < 9.0 && best.as_ref().is_none_or(|b| d < b.0) {
+                        best = Some((d, Seat::Plane, door, face));
+                    }
+                }
+                match best {
+                    Some((_, seat, door, face)) => {
+                        self.seat_next = Some(seat);
+                        self.pilot.auto = Some((door, face));
+                    }
+                    None => self.hint("Nothing to get into here: walk up to a door, or press 1 or 2 for a car", 3.0),
+                }
+            }
+        }
+    }
+
+    /// A car pulls up in front of the pilot.
+    fn call_car(&mut self, k: usize) {
+        let f = self.pilot.forward();
+        let at = self.pilot.pos + f * 7.0;
+        let heading = self.pilot.heading + std::f64::consts::FRAC_PI_2;
+        self.garage.spawn(k, at, heading, &self.world, &mut self.r);
+        self.hint(&format!("{} - walk to the driver's door and press Enter", vehicle::KINDS[k].name), 4.0);
+    }
+
+    /// The cars' physics, the pilot's legs, getting in and out, and what the crashes throw about.
+    fn ground_tick(&mut self, dt: f64, in_menu: bool, femit: &mut Vec<(DVec3, render::Particle)>) {
+        if in_menu || dt <= 0.0 {
+            return;
+        }
+        if self.time > 1.0 {
+            if let Some(what) = self.drive_at.take() {
+                // Start out of the aircraft, and maybe in a car beside it.
+                let (door, _, face) = self.plane_door();
+                self.pilot.get_out(door, door, face + std::f64::consts::PI, &self.world);
+                self.seat = Seat::Foot;
+                if let Some(k) = vehicle::KINDS.iter().position(|k| k.key == what) {
+                    let i = self.garage.spawn(k, door + self.pilot.forward() * 8.0, self.pilot.heading, &self.world, &mut self.r);
+                    self.seat = Seat::Car(i);
+                    self.pilot.shown = false;
+                }
+            }
+        }
+        let k = |c: KeyCode| self.keys.contains(&c);
+        let ax = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f64;
+        let fwd = ax(k(KeyCode::KeyW) || k(KeyCode::ArrowUp), k(KeyCode::KeyS) || k(KeyCode::ArrowDown));
+        let side = ax(k(KeyCode::KeyD) || k(KeyCode::ArrowRight), k(KeyCode::KeyA) || k(KeyCode::ArrowLeft));
+        let driven = if let Seat::Car(i) = self.seat { Some(i) } else { None };
+        let drive = vehicle::Drive { throttle: fwd, steer: side, handbrake: k(KeyCode::Space) };
+        let mut hits = Vec::new();
+        if !self.garage.cars.is_empty() {
+            self.car_acc = (self.car_acc + dt).min(0.1);
+            let h = 1.0 / 120.0;
+            while self.car_acc >= h {
+                self.car_acc -= h;
+                self.garage.step(h, driven, drive, &self.world, &mut hits);
+            }
+        }
+        if self.pilot.shown {
+            let walk = if self.seat == Seat::Foot { pilot::Walk { fwd, turn: side, run: k(KeyCode::ShiftLeft) || k(KeyCode::ShiftRight) } } else { pilot::Walk::default() };
+            let was_stepping = self.pilot.stepping();
+            if self.pilot.update(dt, walk, &self.world) {
+                match (was_stepping, self.seat_next) {
+                    (false, Some(next)) => {
+                        // At the door: climb in.
+                        let (seat, face) = match next {
+                            Seat::Car(i) => {
+                                let c = &self.garage.cars[i];
+                                (c.eye() - c.up() * 0.7, self.pilot.heading)
+                            }
+                            _ => (self.plane_door().1, self.pilot.heading),
+                        };
+                        self.pilot.get_in(seat, face);
+                    }
+                    (true, Some(next)) => {
+                        self.seat = next;
+                        self.seat_next = None;
+                        self.pilot.shown = false;
+                        self.cam_blend = Some((self.last_view.0, self.last_view.1, self.real));
+                        if let Seat::Car(_) = next {
+                            self.hint("Driving: W gas, S brake / reverse, A/D steer, Space handbrake, C inside view, Enter get out", 6.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if hits.is_empty() {
+            return;
+        }
+        self.anchor_fx(hits[0].pos);
+        vehicle::particles(&hits, &mut self.rng, femit);
+        let hardest = hits.iter().filter(|h| h.kind != vehicle::HitKind::Scrape).map(|h| h.speed).fold(0.0, f64::max);
+        if hardest > 4.0 {
+            if let Some(a) = &self.audio {
+                a.event(audio::Event::Crunch((hardest / 20.0).clamp(0.3, 1.6) as f32));
+            }
+        }
+        // A fast car through a small building brings it down.
+        let mut felled = Vec::new();
+        for hit in &hits {
+            if let vehicle::HitKind::Building(tile, idx, area) = hit.kind {
+                if hit.speed > 13.0 && area < 120.0 * hit.speed as f32 && !felled.contains(&(tile, idx)) {
+                    felled.push((tile, idx));
+                    let vel = driven.map(|i| self.garage.cars[i].vel).unwrap_or(-hit.normal * hit.speed);
+                    self.bring_down(tile, idx, hit.pos, vel, None, femit);
+                }
+            }
+        }
+    }
+
+    /// The camera on foot and on the road (and gliding there from wherever it was).
+    fn body_camera(&mut self, cam: DVec3, dir: DVec3, upv: DVec3, dt: f64) -> (DVec3, DVec3, DVec3) {
+        let up_at = |p: DVec3| p.normalize();
+        let (mut cam, mut dir, mut upv) = (cam, dir, upv);
+        match self.seat {
+            Seat::Plane if !self.pilot.shown => {}
+            Seat::Car(i) => {
+                let c = &self.garage.cars[i];
+                if self.cam_mode == 1 {
+                    let q = c.rot * DQuat::from_rotation_y(-self.cam_yaw) * DQuat::from_rotation_x(self.cam_pitch);
+                    cam = c.eye();
+                    dir = q * DVec3::NEG_Z;
+                    upv = c.up();
+                } else {
+                    let u = up_at(c.pos);
+                    let f = c.forward();
+                    let flat = (f - u * f.dot(u)).normalize_or(f);
+                    let back = DQuat::from_axis_angle(u, self.cam_yaw) * -flat;
+                    let tilt = 0.2 + self.cam_pitch.clamp(-0.3, 1.2);
+                    let want = c.pos + (back * tilt.cos() + u * tilt.sin()) * c.kind.cam + u * 0.8;
+                    self.cam_pos += (want - self.cam_pos) * (dt * 6.0).min(1.0);
+                    if (self.cam_pos - want).length() > 30.0 {
+                        self.cam_pos = want;
+                    }
+                    cam = self.cam_pos;
+                    dir = (c.pos + u * 0.9 - cam).normalize();
+                    upv = u;
+                }
+            }
+            _ => {
+                // Behind and above the pilot's shoulder.
+                let p = self.pilot.pos;
+                let u = up_at(p);
+                let f = self.pilot.forward();
+                let back = DQuat::from_axis_angle(u, self.cam_yaw) * -f;
+                let tilt = 0.25 + self.cam_pitch.clamp(-0.5, 1.2);
+                let head = p + u * 1.55;
+                let want = head + (back * tilt.cos() + u * tilt.sin()) * 3.6 + self.pilot.rot() * DVec3::X * 0.45;
+                self.cam_pos += (want - self.cam_pos) * (dt * 7.0).min(1.0);
+                if (self.cam_pos - want).length() > 30.0 {
+                    self.cam_pos = want;
+                }
+                cam = self.cam_pos;
+                dir = (head + f * 0.8 - cam).normalize();
+                upv = u;
+            }
+        }
+        if let Some((from, fdir, t0)) = self.cam_blend {
+            let k = ((self.real - t0) / 0.9).clamp(0.0, 1.0);
+            let s = k * k * (3.0 - 2.0 * k);
+            cam = from.lerp(cam, s);
+            dir = fdir.lerp(dir, s).normalize_or(dir);
+            if k >= 1.0 {
+                self.cam_blend = None;
+            }
+        }
+        self.last_view = (cam, dir);
+        (cam, dir, upv)
+    }
+}
+
 struct App {
     args: Args,
     game: Option<Game>,
@@ -5384,7 +5668,14 @@ fn ortho(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) -> Mat4 {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,fablegame=info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,openflight=info")).init();
+    // The game was called fablegame: keep the tiles and settings it saved under that name.
+    for d in [crate::plat::cache_dir(), crate::plat::config_dir()].into_iter().flatten() {
+        let (old, new) = (d.join("fablegame"), d.join("openflight"));
+        if old.is_dir() && !new.exists() {
+            let _ = std::fs::rename(old, new);
+        }
+    }
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);
     el.run_app(&mut App { args: parse_args(), game: None })?;
@@ -5402,7 +5693,7 @@ fn main() {
     struct Console;
     impl log::Log for Console {
         fn enabled(&self, m: &log::Metadata) -> bool {
-            m.level() <= log::Level::Warn || (m.level() <= log::Level::Info && m.target().starts_with("fablegame"))
+            m.level() <= log::Level::Warn || (m.level() <= log::Level::Info && m.target().starts_with("openflight"))
         }
         fn log(&self, r: &log::Record) {
             if self.enabled(r.metadata()) {

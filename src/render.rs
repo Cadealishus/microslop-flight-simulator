@@ -2207,6 +2207,22 @@ impl Renderer {
         self.meshes.push(MeshGpu { vbuf, ibuf, n_idx: idx.len() as u32 });
         self.meshes.len() - 1
     }
+    /// A mesh whose vertices and indices are rewritten in place (`write_mesh`):
+    /// a car that crumples, a pilot who walks.
+    pub fn add_dynamic_mesh(&mut self, verts: &[PartVertex], idx: &[u32]) -> usize {
+        let u = wgpu::BufferUsages::COPY_DST;
+        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(verts), usage: wgpu::BufferUsages::VERTEX | u });
+        let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(idx), usage: wgpu::BufferUsages::INDEX | u });
+        self.meshes.push(MeshGpu { vbuf, ibuf, n_idx: idx.len() as u32 });
+        self.meshes.len() - 1
+    }
+    /// New vertices (and, if given, indices) for a dynamic mesh, the same counts as it was made with.
+    pub fn write_mesh(&mut self, i: usize, verts: &[PartVertex], idx: Option<&[u32]>) {
+        self.queue.write_buffer(&self.meshes[i].vbuf, 0, bytemuck::cast_slice(verts));
+        if let Some(idx) = idx {
+            self.queue.write_buffer(&self.meshes[i].ibuf, 0, bytemuck::cast_slice(idx));
+        }
+    }
     /// Swap the geometry behind an existing mesh id.
     pub fn replace_mesh(&mut self, i: usize, verts: &[PartVertex], idx: &[u32]) {
         let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(verts), usage: wgpu::BufferUsages::VERTEX });

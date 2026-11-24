@@ -26,6 +26,8 @@ The first run on Windows or Mac builds the game from this source code, which tak
 
 **Crashes and damage:** parts can break off, engines can catch fire, and buildings can be knocked down.
 
+**On foot and on the road:** stop on the ground (or crash) and press **Enter** to climb out of the aircraft as the pilot, a photo-scanned person whose walk is matched to the speed they move, so the feet don't slide. Press **1** for a Ford F-150 Raptor R or **2** for a Lamborghini Countach LPI 800-4, walk up to the driver's door and press **Enter** to get in. The cars hang on four springs with tyres that grip, slide and drift (Space is the handbrake), roll over, scrape sparks, and crumple where they hit: the body dents around the impact as deep as the speed lost, windows burst, wheels come off, and a fast enough car brings down a small building. Walk back to the aircraft and press **Enter** to fly again. Start straight away in a car with `--drive raptor` (or `?drive=countach` in the browser), or on foot with `--drive foot`.
+
 **Sound:** engines, wind, gear, flaps and cockpit warnings are made by a synthesizer as you fly, not from recordings (apart from the fighters' roar and the menu music).
 
 **Multiplayer:** fly with friends in a room with a 5-letter code. Windows, Mac and the browser version all play together. Other players appear as the aircraft they're really flying, with green name tags (and a box around them when they're within 3 km). Their crashes play the full explosion, fire and wreck for everyone, and the host's time of day and weather are everyone's. See [Multiplayer](#multiplayer).
@@ -59,6 +61,7 @@ The first run on Windows or Mac builds the game from this source code, which tak
 | C | cockpit or chase camera |
 | mouse drag, wheel | look around, zoom |
 | R | start again here |
+| Enter | get out of the aircraft or car / get into the nearest one |
 | G | go to a place or airport |
 | T / Y | time of day later / earlier |
 | N / M | more / fewer clouds |
@@ -74,6 +77,8 @@ The first run on Windows or Mac builds the game from this source code, which tak
 | F12 | screenshot |
 
 **Gamepad (Xbox layout, as Microsoft Flight Simulator sets it up):** left stick pitch and roll, triggers rudder, hold A / B throttle up / down, hold X brakes, Y + B parking brake, Y + d-pad trim, bumpers flaps, left stick click gear, right stick look around, d-pad quick views, View button cockpit or chase camera, Menu button pause.
+
+**On foot:** W / S walk forward / back, A / D turn, Shift run, 1 / 2 call a Raptor / Countach, Enter get in. **Driving:** W gas, S brake and reverse, A / D steer, Space handbrake, C inside or chase view, mouse drag look around, Enter get out (below 15 km/h).
 
 # Multiplayer
 
@@ -99,7 +104,7 @@ Rooms are public: anyone with the code can join, and positions and names go thro
 
 **The rest:** `weather.rs` and `live.rs` (weather and real traffic), `traffic.rs` and `cars.rs` (airport and road traffic), `audio.rs` (the synthesizer), `menu.rs` (globe and menus), `career.rs` (logbook), `cockpit.rs` and `gauges.rs` (instruments), `plat.rs` (what differs between the desktop and the browser).
 
-**Saved on your computer:** downloaded map tiles in your user cache folder (`fablegame`), and next to the game the career logbook (`career.txt`), graphics settings (`settings.txt`) and your multiplayer name (`mp_name.txt`).
+**Saved on your computer:** downloaded map tiles in your user cache folder (`openflight`), and next to the game the career logbook (`career.txt`), graphics settings (`settings.txt`) and your multiplayer name (`mp_name.txt`).
 
 # Command-line options
 
@@ -153,3 +158,6 @@ Desktop options go in the address: `?no-menu&airport=KSFO&runway=28R` is `--no-m
 
 # Contributions
 Please contribute anything if you want to! Improvements to flight sim realism, graphics, optimization, UI, and especially plane models are needed! (((=
+
+# Vehicle models
+The cars and the pilot are downloaded models converted with `tools/vehicle_import.py` (Python with NumPy and Pillow, no Blender): `python tools/vehicle_import.py car <model.glb> <key> <nose axis> [<length m> [<paint r,g,b>]]` for a car (its wheels need "wheel", "tire" or "rim" in their names), `python tools/vehicle_import.py ped <walking.glb> <key>` for a character with a walk animation. Credits and licences: [assets/vehicles/CREDITS.md](assets/vehicles/CREDITS.md). The two cars are CC-BY-NC-SA (non-commercial).

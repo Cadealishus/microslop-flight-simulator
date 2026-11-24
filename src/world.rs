@@ -676,6 +676,39 @@ impl World {
         out
     }
 
+    /// As `footprints_near`, with which building each is (to bring it down) and its area.
+    pub fn footprints_near_ids(&self, p: DVec3, r: f64) -> Vec<(Vec<DVec3>, f64, f64, bool, (TileId, usize), f32)> {
+        let (lat, lon, _) = geo::pos_to_lla(p);
+        if self.hidden(lat, lon) {
+            return Vec::new();
+        }
+        let c = TileId::at(lat, lon, DATA_ZOOM);
+        let size = 1i64 << DATA_ZOOM;
+        let mut out = Vec::new();
+        for dy in -1..=1i64 {
+            for dx in -1..=1i64 {
+                let (x, y) = ((c.x as i64 + dx).rem_euclid(size), c.y as i64 + dy);
+                if y < 0 || y >= size {
+                    continue;
+                }
+                let id = TileId::new(DATA_ZOOM, x as u32, y as u32);
+                let Some(BSlot::Ready(b)) = self.builds.get(&id) else { continue };
+                let lp = (p - b.center).as_vec3();
+                for (i, f) in b.footprints.iter().enumerate() {
+                    if !f.alive || (f.center - lp).length() > r as f32 + f.area.sqrt() {
+                        continue;
+                    }
+                    let ring = f.ring.iter().map(|q| {
+                        let (la, lo) = id.lat_lon(q[0] as f64, q[1] as f64);
+                        geo::lla_to_pos(la, lo, f.base as f64)
+                    }).collect();
+                    out.push((ring, f.base as f64, f.top as f64, f.kind == 1, (id, i), f.area));
+                }
+            }
+        }
+        out
+    }
+
     /// Standing buildings and bridge decks near a point: outline (planet
     /// frame, at the base), base and top altitude, whether it is a bridge.
     pub fn footprints_near(&self, p: DVec3, r: f64) -> Vec<(Vec<DVec3>, f64, f64, bool)> {

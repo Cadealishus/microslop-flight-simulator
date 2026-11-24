@@ -18,7 +18,7 @@ impl Fetcher {
         #[cfg(not(target_arch = "wasm32"))]
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(20)))
-            .user_agent("fablegame-flightsim/0.1")
+            .user_agent("openflight-flightsim/0.1")
             .build()
             .into();
         Self {

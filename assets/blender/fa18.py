@@ -1,4 +1,4 @@
-# The F/A-18C Hornet for FableFlight, built procedurally in Blender.
+# The F/A-18C Hornet for Openflight, built procedurally in Blender.
 #
 #   blender -b --factory-startup --python assets/blender/fa18.py -- <repo>/assets [--render <dir>] [--guides <dir>]
 #

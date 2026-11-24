@@ -911,42 +911,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fablegame"
-version = "0.1.0"
-dependencies = [
- "ab_glyph",
- "anyhow",
- "bytemuck",
- "console_error_panic_hook",
- "crossbeam-channel",
- "dirs",
- "earcutr",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "env_logger",
- "flate2",
- "gilrs",
- "glam",
- "image",
- "js-sys",
- "log",
- "naga",
- "parking_lot 0.13.0",
- "pollster",
- "rodio",
- "serde_json",
- "tungstenite",
- "ureq",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "web-time",
- "wgpu",
- "winit",
-]
-
-[[package]]
 name = "fax"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2356,6 +2320,42 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "openflight"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "anyhow",
+ "bytemuck",
+ "console_error_panic_hook",
+ "crossbeam-channel",
+ "dirs",
+ "earcutr",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "env_logger",
+ "flate2",
+ "gilrs",
+ "glam",
+ "image",
+ "js-sys",
+ "log",
+ "naga",
+ "parking_lot 0.13.0",
+ "pollster",
+ "rodio",
+ "serde_json",
+ "tungstenite",
+ "ureq",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
+ "wgpu",
+ "winit",
+]
 
 [[package]]
 name = "option-ext"

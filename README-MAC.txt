@@ -18,7 +18,7 @@ folder) and starts it. If the game stops with an error, the window stays open
 so you can read why.
 
 The game downloads map data (satellite imagery, terrain heights, buildings,
-roads) as you fly and keeps it in your user cache folder (fablegame), so
+roads) as you fly and keeps it in your user cache folder (openflight), so
 places you've flown before load faster. Your career logbook is career.txt in
 this folder. The full description of the game and its controls is in
 README.md.
