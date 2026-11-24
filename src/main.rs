@@ -5255,17 +5255,39 @@ impl Game {
         if in_menu || dt <= 0.0 {
             return;
         }
-        if self.time > 1.0 {
-            if let Some(what) = self.drive_at.take() {
-                // Start out of the aircraft, and maybe in a car beside it.
-                let (door, _, face) = self.plane_door();
-                self.pilot.get_out(door, door, face + std::f64::consts::PI, &self.world);
-                self.seat = Seat::Foot;
-                if let Some(k) = vehicle::KINDS.iter().position(|k| k.key == what) {
-                    let i = self.garage.spawn(k, door + self.pilot.forward() * 8.0, self.pilot.heading, &self.world);
-                    self.seat = Seat::Car(i);
-                    self.pilot.shown = false;
+        if self.drive_at.is_some() && self.time > 1.0 {
+            // Start out of the aircraft (`foot`), or in a car where it started
+            // (`raptor`, `countach@30` for already doing 30 m/s), once the ground
+            // there has loaded: the aircraft is parked behind, out of the way.
+            let what = self.drive_at.clone().unwrap();
+            let (key, speed) = what.split_once('@').map(|(k, v)| (k.to_string(), v.parse::<f64>().unwrap_or(0.0))).unwrap_or((what.clone(), 0.0));
+            let p = self.plane.pos;
+            let (la, lo, _) = geo::pos_to_lla(p);
+            let ready = self.world.ground(la, lo).is_some() && (speed <= 0.0 || !self.world.footprints_near_ids(p, 80.0).is_empty() || self.time > 30.0);
+            if ready {
+                self.drive_at = None;
+                let fwd = self.plane.forward();
+                let (e, n, u) = geo::enu(p);
+                let flat = (fwd - u * fwd.dot(u)).normalize();
+                let heading = flat.dot(e).atan2(flat.dot(n));
+                let g = self.world.ground(la, lo).map(|g| g.h).unwrap_or(0.0);
+                let at = geo::lla_to_pos(la, lo, g);
+                match vehicle::KINDS.iter().position(|k| k.key == key) {
+                    Some(k) => {
+                        let i = self.garage.spawn(k, at, heading, &self.world);
+                        self.garage.cars[i].vel = flat * speed;
+                        self.seat = Seat::Car(i);
+                        self.pilot.shown = false;
+                    }
+                    None => {
+                        self.pilot.get_out(at, at, heading, &self.world);
+                        self.seat = Seat::Foot;
+                    }
                 }
+                let back = at - flat * 70.0;
+                let (bl, bo, _) = geo::pos_to_lla(back);
+                let bg = self.world.ground(bl, bo).map(|g| g.h).unwrap_or(g);
+                self.respawn_ground(bl, bo, bg, heading, 0.0);
             }
         }
         let k = |c: KeyCode| self.keys.contains(&c);
