@@ -129,7 +129,9 @@ pub struct Wall {
     mesh: Option<usize>,
 }
 impl Wall {
+    /// (`rot` must be a rotation: its axes right-handed, x cross y = z.)
     pub fn new(center: DVec3, rot: DQuat, half: DVec3) -> Wall {
+        debug_assert!(rot.is_normalized());
         Wall { center, rot, half, mesh: None }
     }
     /// Inside? Then the way out through the nearest face, and how deep.
@@ -863,7 +865,7 @@ impl Car {
                 s.dirty = Some(s.dirty.map_or((a, b), |(x, y)| (x.min(a), y.max(b))));
             }
             // Glass near a hard hit bursts.
-            if si == 1 && dv > 7.0 {
+            if si == 1 && dv > 12.0 {
                 let reach = radius * 1.3;
                 for t in s.i.chunks_mut(3) {
                     if t[0] == t[1] {

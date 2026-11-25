@@ -5385,7 +5385,7 @@ impl Game {
                             // A concrete wall 40 m ahead, square across the car's path.
                             let start = self.garage.cars[i].origin();
                             let u = start.normalize();
-                            let wall = vehicle::Wall::new(start + flat * 40.0 + u * 1.5, DQuat::from_mat3(&glam::DMat3::from_cols(flat.cross(u), u, flat)), DVec3::new(7.0, 1.5, 0.6));
+                            let wall = vehicle::Wall::new(start + flat * 40.0 + u * 1.5, DQuat::from_mat3(&glam::DMat3::from_cols(u.cross(flat), u, flat)), DVec3::new(7.0, 1.5, 0.6));
                             self.garage.walls = vec![wall];
                             self.crash_start = Some((start, heading, speed));
                             self.hint("Crash test: R runs it again, O slow motion, F4 the physics overlay", 6.0);
