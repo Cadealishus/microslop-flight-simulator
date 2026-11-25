@@ -27,7 +27,9 @@ use crate::geo;
 use crate::render::{DrawObj, PartVertex, Particle, Renderer};
 use crate::world::World;
 use glam::{DMat3, DQuat, DVec2, DVec3, Mat4, Vec3};
+use crate::softbody::{Build, Lattice, Skinning};
 use std::io::Read;
+use std::sync::Arc;
 
 /// The shader's id for a car (DrawObj glow.y): no aircraft's paint or panel lines.
 const SHADER_KIND: f32 = 20.0;
@@ -76,7 +78,7 @@ pub static KINDS: [Kind; 2] = [
         steer: 0.6,
         down: 0.0,
         crush: [0.9, 0.6, 0.35],
-        crush_g: 32.0,
+        crush_g: 25.0,
         eye: Vec3::new(-0.42, 1.78, -0.15),
         cam: 9.0,
     },
@@ -149,8 +151,12 @@ impl Wall {
     }
     /// Inside? Then the way out through the nearest face, and how deep.
     fn inside(&self, p: DVec3) -> Option<(DVec3, f64)> {
+        self.inside_by(p, 0.0)
+    }
+    /// The same for a ball of radius `r` at `p`.
+    fn inside_by(&self, p: DVec3, r: f64) -> Option<(DVec3, f64)> {
         let q = self.rot.inverse() * (p - self.center);
-        let d = self.half - q.abs();
+        let d = self.half + DVec3::splat(r) - q.abs();
         if d.min_element() <= 0.0 {
             return None;
         }
@@ -235,9 +241,13 @@ struct Shape {
     wheels: [Part; 4],
     lo: Vec3,
     hi: Vec3,
+    /// the body's structure as built, and each mesh's ties to it (body, glass, then each part's skin and glass)
+    lattice: Lattice,
+    skinning: Arc<Vec<Skinning>>,
 }
 
-fn load(bytes: &[u8]) -> Shape {
+fn load(kind: &Kind) -> Shape {
+    let bytes = kind.model;
     let mut raw = Vec::new();
     flate2::read::GzDecoder::new(bytes).read_to_end(&mut raw).expect("car model");
     let mut at = 0usize;
@@ -303,7 +313,13 @@ fn load(bytes: &[u8]) -> Shape {
         let id = k as u8 + 1;
         (d, whole.subset(|v, p| p == id && !glass(v)), whole.subset(|v, p| p == id && glass(v)))
     }).collect();
-    Shape { body: whole.subset(|v, p| p == 0 && !glass(v)), glass: whole.subset(|v, p| p == 0 && glass(v)), parts, wheels, lo, hi }
+    let (body, glass) = (whole.subset(|v, p| p == 0 && !glass(v)), whole.subset(|v, p| p == 0 && glass(v)));
+    let parts: Vec<(PartDef, Part, Part)> = parts;
+    let meshes: Vec<&Part> = [&body, &glass].into_iter().chain(parts.iter().flat_map(|(_, a, b)| [a, b])).collect();
+    let all: Vec<Vec3> = meshes.iter().flat_map(|m| m.v.iter().map(|v| Vec3::from(v.pos))).collect();
+    let lattice = Lattice::build(&all, &Build { lo, hi, crush: kind.crush.map(|c| c as f32), front_force: (kind.mass * 9.81 * kind.crush_g) as f32 });
+    let skinning = Arc::new(meshes.iter().map(|m| Skinning::new(&lattice, &m.v.iter().map(|v| Vec3::from(v.pos)).collect::<Vec<_>>())).collect());
+    Shape { body, glass, parts, wheels, lo, hi, lattice, skinning }
 }
 
 /// What a part is doing.
@@ -393,6 +409,8 @@ fn rb_impulse(pos: DVec3, vel: &mut DVec3, w: &mut DVec3, rot: DQuat, inertia: D
 /// A car's own copy of a mesh, dented as it crashes.
 struct Skin {
     v: Vec<PartVertex>,
+    /// the normals as built (crinkles are worked out from these)
+    nrm0: Vec<Vec3>,
     /// as it came from the model, for a reset
     orig_i: Vec<u32>,
     rest: Vec<Vec3>,
@@ -408,7 +426,7 @@ impl Skin {
         Skin::new(&Part::empty())
     }
     fn new(p: &Part) -> Skin {
-        Skin { v: p.v.clone(), orig_i: p.i.clone(), rest: p.v.iter().map(|v| Vec3::from(v.pos)).collect(), i: p.i.clone(), mesh: None, dirty: None, idx_dirty: false }
+        Skin { nrm0: p.v.iter().map(|v| Vec3::from(v.nrm)).collect(), v: p.v.clone(), orig_i: p.i.clone(), rest: p.v.iter().map(|v| Vec3::from(v.pos)).collect(), i: p.i.clone(), mesh: None, dirty: None, idx_dirty: false }
     }
     fn upload(&mut self, r: &mut Renderer) -> usize {
         match self.mesh {
@@ -453,14 +471,11 @@ pub struct Car {
     k: f64,
     c: f64,
     inertia: DVec3,
-    /// the hull points now, as built, which way each crushes into the body,
-    /// how far it has, how far it can, and crush not yet shown in the mesh
+    /// the hull points (for the ground)
     hull: Vec<DVec3>,
-    hull0: Vec<DVec3>,
-    inward: Vec<DVec3>,
-    crush: Vec<f64>,
-    crush_max: Vec<f64>,
-    crush_shown: Vec<f64>,
+    /// the body's structure (what walls, buildings and other cars hit), and each mesh's ties to it
+    pub lattice: Lattice,
+    skinning: Arc<Vec<Skinning>>,
     lo: Vec3,
     hi: Vec3,
     body: Skin,
@@ -503,7 +518,7 @@ impl Garage {
             self.wheel_mesh.resize(KINDS.len(), None);
         }
         if self.shapes[k].is_none() {
-            self.shapes[k] = Some(load(KINDS[k].model));
+            self.shapes[k] = Some(load(&KINDS[k]));
         }
         self.shapes[k].as_ref().unwrap()
     }
@@ -529,35 +544,16 @@ impl Garage {
         let cg = DVec3::new(0.0, kind.cg, 0.0);
         let strut = [0, 1, 2, 3].map(|w| s.wheels[w].hub.as_dvec3() - cg + DVec3::Y * kind.travel);
         let radius = [0, 1, 2, 3].map(|w| s.wheels[w].r as f64);
-        // The hull: the corners and edges of the body, low and high.
-        // Each point crushes into the body: the front and back ones along the car,
-        // the side ones across it, the roof ones down.
+        // The hull: the corners and edges of the body, low and high (what meets the ground).
         let mut hull = Vec::new();
-        let (mut inward, mut crush_max) = (Vec::new(), Vec::new());
         let (x0, x1, z0, z1) = (lo.x as f64 * 0.94, hi.x as f64 * 0.94, lo.z as f64 * 0.97, hi.z as f64 * 0.97);
         let ys = [lo.y as f64 + (radius[0] * 0.9).max(0.22), hi.y as f64 * 0.62, hi.y as f64 * 0.97];
         for (j, y) in ys.iter().enumerate() {
             let (sx, sz) = if j == 2 { (0.7, 0.45) } else { (1.0, 1.0) };
             for (x, z) in [(x0, z0), (x1, z0), (x0, z1), (x1, z1), (0.0, z0), (0.0, z1), (x0, 0.0), (x1, 0.0)] {
                 hull.push(DVec3::new(x * sx, *y, z * sz) - cg);
-                let (dir, most) = if j == 2 {
-                    (DVec3::NEG_Y, 0.3)
-                } else if x != 0.0 && z != 0.0 {
-                    // A corner gives way to a hit from the front (or back) or the side.
-                    let along = if z < 0.0 { DVec3::Z } else { DVec3::NEG_Z };
-                    ((along + DVec3::X * -x.signum() * 0.8).normalize(), kind.crush[if z < 0.0 { 0 } else { 1 }])
-                } else if z < 0.0 {
-                    (DVec3::Z, kind.crush[0])
-                } else if z > 0.0 {
-                    (DVec3::NEG_Z, kind.crush[1])
-                } else {
-                    (DVec3::X * -x.signum(), kind.crush[2])
-                };
-                inward.push(dir);
-                crush_max.push(most);
             }
         }
-        let nh = hull.len();
         let parts = s
             .parts
             .iter()
@@ -570,6 +566,7 @@ impl Garage {
         let pos = geo::lla_to_pos(geo::pos_to_lla(at).0, geo::pos_to_lla(at).1, g) + u * (kind.cg + 0.05);
         let (body, glass) = (Skin::new(&s.body), Skin::new(&s.glass));
         let rest = kind.travel + sag;
+        let (lattice, skinning) = (s.lattice.clone(), s.skinning.clone());
         self.cars.push(Car {
             kind,
             pos,
@@ -588,12 +585,9 @@ impl Garage {
             k: k_s,
             c: c_s,
             inertia,
-            hull0: hull.clone(),
             hull,
-            inward,
-            crush: vec![0.0; nh],
-            crush_max,
-            crush_shown: vec![0.0; nh],
+            lattice,
+            skinning,
             lo,
             hi,
             body,
@@ -796,6 +790,10 @@ impl Car {
     }
     /// How far the most crumpled vertex of the body has moved (m).
     pub fn deepest_dent(&self) -> f32 {
+        (0..self.lattice.len()).map(|i| self.lattice.moved(i)).fold(0.0, f32::max)
+    }
+    /// How far the most crumpled vertex of the body has actually moved (m).
+    pub fn deepest_vertex(&self) -> f32 {
         self.body.v.iter().zip(&self.body.rest).map(|(v, r)| (Vec3::from(v.pos) - *r).length()).fold(0.0, f32::max)
     }
     pub fn kind_index(&self) -> usize {
@@ -842,31 +840,31 @@ impl Car {
         rb_impulse(self.pos, &mut self.vel, &mut self.w, self.rot, self.inertia, self.kind.mass, at, n, e, mu, cap)
     }
 
-    /// Hull point `k` at `p` is `depth` into something whose surface normal is `n`.
-    /// Where it can crush (the crumple zones), it gives way as far as it is pushed,
-    /// pushing back with about the force that holds the car at `crush_g`: the
-    /// crushing takes the energy, the car does not bounce. Crushed as far as it
-    /// goes, it is a hard hit.
-    fn crumple_contact(&mut self, k: usize, p: DVec3, n: DVec3, depth: f64, kind: HitKind, hits: &mut Vec<Hit>) {
-        let along = n.dot(self.rot * self.inward[k]);
+    /// Node `i` of the body's structure, at `p`, is `depth` into something whose
+    /// surface normal is `n`. While the structure there can give, the node is
+    /// pushed in as far as it went and resists with its strength: the crushing
+    /// takes the energy and the car does not bounce. Once it cannot give, the
+    /// hit is hard (the much stiffer frame behind).
+    fn node_contact(&mut self, i: usize, p: DVec3, n: DVec3, depth: f64, kind: HitKind, hits: &mut Vec<Hit>) {
+        let dir = (self.rot.inverse() * n).as_vec3();
         let vn = (self.vel + self.w.cross(p - self.pos)).dot(n);
-        if along > 0.3 && self.crush[k] < self.crush_max[k] {
-            let dc = (depth / along).min(self.crush_max[k] - self.crush[k]);
-            self.crush[k] += dc;
-            self.hull[k] = self.hull0[k] + self.inward[k] * self.crush[k];
-            // (Six points across the front share the load in a square hit.)
-            let force = self.kind.mass * 9.81 * self.kind.crush_g / 6.0;
-            self.impulse_capped(p, n, 0.0, 0.3, force * self.h);
+        let strength = self.lattice.strength[i] as f64;
+        if self.lattice.can_give(i, dir) {
+            self.lattice.push(i, dir * depth as f32);
+            self.impulse_capped(p, n, 0.0, 0.3, strength * self.h);
         } else {
-            // Crushed as far as it goes: the frame behind it, much stiffer, but not infinitely.
-            let force = self.kind.mass * 9.81 * self.kind.crush_g / 6.0 * 3.0;
-            self.impulse_capped(p, n, 0.05, 0.35, force * self.h);
+            self.impulse_capped(p, n, 0.05, 0.35, strength * 3.0 * self.h);
             self.pos += n * (depth * 0.5).min(0.05);
         }
         self.debug.contacts.push((p, n));
         if -vn > 2.0 {
             self.dent(p, n, -vn, kind, false, hits);
         }
+    }
+
+    /// Where node `i` is (planet frame).
+    pub fn node(&self, i: usize) -> DVec3 {
+        self.origin() + self.rot * self.lattice.pos[i].as_dvec3()
     }
 
     /// Swing the unlatched parts on their hinges: thrown about by the car's
@@ -1074,12 +1072,19 @@ impl Car {
                 self.dent(p, normal, vn, HitKind::Ground, true, hits);
             }
         }
-        // The hull against the test walls.
-        for k in 0..self.hull.len() {
-            let p = self.pos + self.rot * self.hull[k];
-            for wall in walls {
-                if let Some((nrm, depth)) = wall.inside(p) {
-                    self.crumple_contact(k, p, nrm, depth, HitKind::Wall, hits);
+        // The body's structure against the test walls.
+        if !walls.is_empty() {
+            let reach = self.length();
+            for i in 0..self.lattice.len() {
+                let p = self.node(i);
+                for wall in walls {
+                    if (p - wall.center).length() > wall.half.length() + reach {
+                        continue;
+                    }
+                    // (A node stands for a cell of the body around it: it meets the wall half a cell out.)
+                    if let Some((nrm, depth)) = wall.inside_by(p, self.lattice.cell as f64 * 0.5) {
+                        self.node_contact(i, p, nrm, depth, HitKind::Wall, hits);
+                    }
                 }
             }
         }
@@ -1112,12 +1117,21 @@ impl Car {
         }
         if !self.near.is_empty() {
             let (e, n, _) = geo::enu(self.near_o);
-            for k in 0..self.hull.len() {
-                let p = self.pos + self.rot * self.hull[k];
+            // (Only buildings the car's box reaches.)
+            let c = DVec2::new((self.pos - self.near_o).dot(e), (self.pos - self.near_o).dot(n));
+            let reach = self.length() * 0.6 + 0.5;
+            let close: Vec<usize> = (0..self.near.len()).filter(|&j| {
+                let r = &self.near[j].0;
+                let (lo, hi) = r.iter().fold((DVec2::splat(f64::MAX), DVec2::splat(f64::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
+                c.x > lo.x - reach && c.x < hi.x + reach && c.y > lo.y - reach && c.y < hi.y + reach
+            }).collect();
+            for k in 0..if close.is_empty() { 0 } else { self.lattice.len() } {
+                let p = self.node(k);
                 let alt = p.length() - geo::R;
                 let q = DVec2::new((p - self.near_o).dot(e), (p - self.near_o).dot(n));
                 let mut push = None;
-                for (ring, base, top, id, area) in &self.near {
+                for &j in &close {
+                    let (ring, base, top, id, area) = &self.near[j];
                     if alt < base - 0.5 || alt > *top {
                         continue;
                     }
@@ -1128,27 +1142,59 @@ impl Car {
                 }
                 if let Some((out, depth, id, area)) = push {
                     let nrm = (e * out.x + n * out.y).normalize();
-                    self.crumple_contact(k, p, nrm, depth, HitKind::Building(id.0, id.1, area), hits);
+                    self.node_contact(k, p, nrm, depth, HitKind::Building(id.0, id.1, area), hits);
                 }
             }
         }
         self.swing_parts(h, up);
-        // The mesh catches up with the crush, sixty times a second.
+        // Sixty times a second the structure settles after what pushed it, and the mesh follows.
         if self.time - self.last_flush >= 1.0 / 60.0 {
             self.last_flush = self.time;
-            let cg = DVec3::new(0.0, self.kind.cg, 0.0);
-            for k in 0..self.hull.len() {
-                let dc = self.crush[k] - self.crush_shown[k];
-                if dc > 0.004 {
-                    self.crush_shown[k] = self.crush[k];
-                    // The damage is how much of a crumple zone's worth is used up.
-                    let used: f64 = self.crush.iter().sum::<f64>() / (6.0 * self.kind.crush[0]);
-                    self.damage = self.damage.max(used.min(1.0));
-                    let at = (self.hull0[k] + cg).as_vec3();
-                    self.deform(at, self.inward[k].as_vec3(), dc as f32, (0.5 + self.crush[k] * 0.9) as f32);
+            self.follow();
+        }
+    }
+
+    /// Relax the structure and move every mesh with it.
+    fn follow(&mut self) {
+        if !self.lattice.relax(6) && !self.lattice.dirty.iter().any(|d| *d) {
+            return;
+        }
+        let sk = self.skinning.clone();
+        let lat = &self.lattice;
+        let mut skins: Vec<(&mut Skin, bool)> = vec![(&mut self.body, true), (&mut self.glass, true)];
+        for p in &mut self.parts {
+            // (A part hanging open or gone no longer follows the body.)
+            let on = p.state == PartState::Latched;
+            skins.push((&mut p.skin, on));
+            skins.push((&mut p.glass, on));
+        }
+        for (m, (s, on)) in skins.into_iter().enumerate() {
+            if !on || m >= sk.len() || sk[m].len() != s.v.len() {
+                continue;
+            }
+            let mut touched: Option<(usize, usize)> = None;
+            for k in 0..s.v.len() {
+                let (np, moved) = sk[m].place(lat, k, s.rest[k]);
+                if !moved {
+                    continue;
                 }
+                let off = (np - s.rest[k]).length();
+                // Crumpled metal catches the light unevenly.
+                let side = Vec3::new(hash(k as u32 ^ 0x9e37) - 0.5, hash(k as u32 ^ 0x51ed) - 0.5, hash(k as u32 ^ 0x2f1b) - 0.5);
+                let crinkle = side * (off * 3.0).min(1.0) * 0.9 + side * hash(k as u32) * (off * 0.25).min(0.08) * 0.0;
+                s.v[k].pos = (np + side * (off * 0.12).min(0.06)).into();
+                s.v[k].nrm = (s.nrm0[k] + crinkle).normalize_or_zero().into();
+                touched = Some(touched.map_or((k, k + 1), |(a, b)| (a.min(k), b.max(k + 1))));
+            }
+            if let Some((a, b)) = touched {
+                s.dirty = Some(s.dirty.map_or((a, b), |(x, y)| (x.min(a), y.max(b))));
             }
         }
+        self.lattice.dirty.iter_mut().for_each(|d| *d = false);
+        // The damage is how much of the front's worth of crumpling is used up.
+        let used: f32 = (0..self.lattice.len()).map(|i| self.lattice.moved(i)).sum();
+        let front = self.lattice.rest.iter().filter(|p| p.z < self.lo.z + self.lattice.cell * 1.2).count().max(1) as f32;
+        self.damage = self.damage.max((used / (front * self.kind.crush[0] as f32 * 2.0)).min(1.0) as f64);
     }
 
     fn refresh_near(&mut self, world: &World) {
@@ -1211,8 +1257,6 @@ impl Car {
                 // Knocked open.
                 part.state = PartState::Swinging;
                 part.rate = 2.5;
-            } else if part.state == PartState::Swinging {
-                part.hinge -= (dv as f64 / 25.0).powi(2);
             }
         }
         // Glass near a hard hit bursts.
@@ -1257,37 +1301,13 @@ impl Car {
         }
     }
 
-    /// Push the skin in around `p` (model frame) along `push` by up to `depth`,
-    /// fading out at `radius`, crinkled; every mesh of the car that is still on it.
+    /// Push the structure in around `p` (model frame) along `push` by up to
+    /// `depth`, fading out at `radius` (the mesh follows at the next settle).
     fn deform(&mut self, p: Vec3, push: Vec3, depth: f32, radius: f32) {
-        let skins = [&mut self.body, &mut self.glass].into_iter().chain(self.parts.iter_mut().filter(|q| q.state != PartState::Gone).flat_map(|q| [&mut q.skin, &mut q.glass]));
-        for s in skins {
-            let mut touched: Option<(usize, usize)> = None;
-            for (k, v) in s.v.iter_mut().enumerate() {
-                let q = Vec3::from(v.pos);
-                let dist = q.distance(p);
-                if dist > radius {
-                    continue;
-                }
-                let x = dist / radius;
-                let fall = (1.0 - x * x).powi(2);
-                let crinkle = 0.65 + 0.7 * hash(k as u32);
-                let side = Vec3::new(hash(k as u32 ^ 0x9e37) - 0.5, hash(k as u32 ^ 0x51ed) - 0.5, hash(k as u32 ^ 0x2f1b) - 0.5);
-                let mut np = q + push * depth * fall * crinkle + side * depth * fall * 0.18;
-                // Metal folds, it does not stretch forever.
-                let rest = s.rest[k];
-                let moved = np - rest;
-                if moved.length() > 0.95 {
-                    np = rest + moved.normalize() * 0.95;
-                }
-                v.pos = np.into();
-                // Crinkled panels catch the light unevenly.
-                v.nrm = (Vec3::from(v.nrm) + side * fall * (depth * 4.0).min(1.2)).normalize_or_zero().into();
-                touched = Some(touched.map_or((k, k + 1), |(a, b)| (a.min(k), b.max(k + 1))));
-            }
-            if let Some((a, b)) = touched {
-                s.dirty = Some(s.dirty.map_or((a, b), |(x, y)| (x.min(a), y.max(b))));
-            }
+        for i in self.lattice.near(p, radius) {
+            let x = self.lattice.pos[i].distance(p) / radius;
+            let fall = (1.0 - x * x).powi(2);
+            self.lattice.push(i, push * depth * fall);
         }
     }
 
@@ -1615,6 +1635,33 @@ mod tests {
         assert!(g.cars[0].deepest_dent() < 1e-6 && g.cars[0].damage == 0.0 && g.cars.len() == 1);
         assert!(g.debris.is_empty(), "the parts lying about came back with the reset");
         assert!(g.cars[0].part_states().iter().all(|p| p.1 == PartState::Latched));
+    }
+
+    #[test]
+    fn wraps_around_a_pole() {
+        let w = flat_world();
+        let mut g = Garage::default();
+        let p = geo::lla_to_pos(0.6, -2.1, 0.0);
+        let (e, n, u) = geo::enu(p);
+        g.spawn(0, p, 0.0, &w);
+        let c = &g.cars[0];
+        println!("lattice: {} nodes, {} beams, cell {:.2} m", c.lattice.len(), c.lattice.beams.len(), c.lattice.cell);
+        // A 30 cm pole dead ahead, at 50 km/h.
+        g.walls.push(Wall::new(p + n * 20.0 + u * 2.0, e, u, DVec3::new(0.15, 2.0, 0.15)));
+        run(&mut g, &w, 1.0, Drive::default());
+        g.cars[0].launch(n * 14.0);
+        run(&mut g, &w, 3.0, Drive::default());
+        let c = &g.cars[0];
+        // The front's nodes: how far in at the middle (by the pole) and out at the corners.
+        let front: Vec<usize> = (0..c.lattice.len()).filter(|&i| c.lattice.rest[i].z < c.lo.z + c.lattice.cell * 1.5).collect();
+        let at = |pick: &dyn Fn(f32) -> bool| front.iter().filter(|&&i| pick(c.lattice.rest[i].x)).map(|&i| c.lattice.moved(i)).fold(0.0f32, f32::max);
+        let (middle, corners) = (at(&|x| x.abs() < 0.3), at(&|x| x.abs() > 0.8));
+        let (bent, broken) = c.lattice.stats();
+        println!("pole: middle in {middle:.2} m, corners {corners:.2} m, {bent} beams bent, {broken} snapped, peak {:.0} g, mesh moved {:.2} m", c.debug.g_peak, c.deepest_vertex());
+        assert!(middle > 0.35, "the middle barely went in ({middle:.2} m)");
+        assert!(middle > corners * 2.0 + 0.1, "the front went in flat, not around the pole: middle {middle:.2}, corners {corners:.2}");
+        assert!(bent > 10, "nothing bent");
+        assert!(c.deepest_vertex() > 0.25, "the mesh did not follow the structure");
     }
 
     #[test]
