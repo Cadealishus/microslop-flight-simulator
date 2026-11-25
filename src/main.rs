@@ -220,6 +220,8 @@ struct Args {
     drive: Option<String>,
     /// a car driven at a wall on a salt flat, the same crash every time (`raptor@25`)
     crashtest: Option<String>,
+    /// the physics overlay at the start (F4): 0 off, 1 hull, 2 structure
+    overlay: Option<u8>,
     /// from this many seconds on, full throttle with the boost key held (the afterburners), for scripted screenshots and recordings
     boost_at: Option<f64>,
     /// game time stands still for this many wall-clock seconds at the start (tiles stream in)
@@ -291,6 +293,7 @@ fn parse_args() -> Args {
         crash_at: None,
         drive: None,
         crashtest: None,
+        overlay: None,
         boost_at: None,
         hold: 0.0,
         size: (1600, 900),
@@ -411,6 +414,7 @@ fn parse_args() -> Args {
             "--imagery" => a.imagery = v.get(i + 1).cloned().unwrap_or(a.imagery.clone()),
             "--crash-at" => a.crash_at = num(&v, i),
             "--drive" => a.drive = v.get(i + 1).cloned(),
+            "--overlay" => a.overlay = v.get(i + 1).and_then(|x| x.parse().ok()),
             "--crashtest" => {
                 a.crashtest = Some(v.get(i + 1).cloned().unwrap_or_else(|| "raptor@25".into()));
                 a.menu = Some(false);
@@ -508,7 +512,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("openflight [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--mute] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--drive foot|raptor|countach[@M/S]] [--crashtest raptor|countach[@M/S]] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("openflight [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--mute] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--drive foot|raptor|countach[@M/S]] [--crashtest raptor|countach[@M/S[@pole]]] [--overlay 0|1|2] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -908,7 +912,7 @@ impl Game {
         let mut g = Self {
             gkey: src.google.key(), gkey_show: false, gm_logo: None, stills: vec![None; aircraft::ALL.len()], window, r, world, src, spec, model, piece_mesh, group_mesh, piece_cut, group_pivots, hangar: Vec::new(), building: Vec::new(), crashed: false, crash: None, crash_real: 0.0, egui_ctx, egui_state, keys: HashSet::new(), drag: false, last_cursor: None,
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { 0 }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
-            utc: (hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, seat: Seat::Plane, seat_next: None, drive_at: args.drive.clone().or(args.crashtest.clone()), crashtest: args.crashtest.is_some(), crash_start: None, crash_report_at: None, slowmo: 1.0, debug_overlay: if args.crashtest.is_some() { 2 } else { 0 }, garage: vehicle::Garage::default(), pilot: pilot::Pilot::new(), car_acc: 0.0, cam_blend: None, last_view: (cam_pos, DVec3::X), wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], taa: args.taa, prev_plane: Mat4::IDENTITY, plane_box,
+            utc: (hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, seat: Seat::Plane, seat_next: None, drive_at: args.drive.clone().or(args.crashtest.clone()), crashtest: args.crashtest.is_some(), crash_start: None, crash_report_at: None, slowmo: 1.0, debug_overlay: args.overlay.unwrap_or(if args.crashtest.is_some() { 2 } else { 0 }).min(2), garage: vehicle::Garage::default(), pilot: pilot::Pilot::new(), car_acc: 0.0, cam_blend: None, last_view: (cam_pos, DVec3::X), wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], taa: args.taa, prev_plane: Mat4::IDENTITY, plane_box,
             frame: 0, fps: 60.0, paused: false, show_help: false, show_hud: !args.no_hud, goto_open: false, goto_text: String::new(), goto_rx: None,
             status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, parking_brake: false, cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
