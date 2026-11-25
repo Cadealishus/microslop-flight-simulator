@@ -217,6 +217,8 @@ struct Args {
     crash_at: Option<f64>,
     /// start on foot (`foot`) or at the wheel of a car (`raptor`, `countach`)
     drive: Option<String>,
+    /// a car driven at a wall on a salt flat, the same crash every time (`raptor@25`)
+    crashtest: Option<String>,
     /// from this many seconds on, full throttle with the boost key held (the afterburners), for scripted screenshots and recordings
     boost_at: Option<f64>,
     /// game time stands still for this many wall-clock seconds at the start (tiles stream in)
@@ -261,6 +263,7 @@ struct Args {
 }
 
 fn parse_args() -> Args {
+    let given_place = crate::plat::args().iter().any(|x| ["--lat", "--lon", "--airport", "--place"].contains(&x.as_str()));
     let mut a = Args {
         lat: 37.8085,
         lon: -122.4650,
@@ -286,6 +289,7 @@ fn parse_args() -> Args {
         record: None,
         crash_at: None,
         drive: None,
+        crashtest: None,
         boost_at: None,
         hold: 0.0,
         size: (1600, 900),
@@ -406,6 +410,10 @@ fn parse_args() -> Args {
             "--imagery" => a.imagery = v.get(i + 1).cloned().unwrap_or(a.imagery.clone()),
             "--crash-at" => a.crash_at = num(&v, i),
             "--drive" => a.drive = v.get(i + 1).cloned(),
+            "--crashtest" => {
+                a.crashtest = Some(v.get(i + 1).cloned().unwrap_or_else(|| "raptor@25".into()));
+                a.menu = Some(false);
+            }
             "--boost-at" => a.boost_at = num(&v, i),
             "--hold" => a.hold = num(&v, i).unwrap_or(0.0),
             "--damage" => a.damage = v.get(i + 1).cloned(),
@@ -499,7 +507,7 @@ fn parse_args() -> Args {
                 used = 1;
             }
             "--help" | "-h" => {
-                println!("openflight [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--mute] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
+                println!("openflight [--menu | --no-menu] [--place \"city or address\"] [--lat D --lon D] [--alt M | --agl M] [--heading DEG] [--time HOURS] [--time-rate X] [--day 0..364] [--clouds 0..1] [--storms 0..1] [--alto 0..1] [--wind KT,FROM_DEG] [--haze 0.2..40] [--weather] [--pause-menu flight|places|weather|game|settings|controls[@SECONDS]] [--airport CODE [--runway 28L] [--approach]] [--max-zoom 8..19] [--cockpit] [--fov DEG] [--no-vsync] [--no-taa] [--mute] [--offline] [--imagery URL_TEMPLATE] [--google | --no-google] [--photoreal | --no-photoreal] [--photo-detail low|medium|high|ultra] [--no-pave] [--google-key KEY] [--hold SECONDS] [--boost-at SECONDS] [--drive foot|raptor|countach[@M/S]] [--crashtest raptor|countach[@M/S]] [--damage rwing=4.3,laileron=0,rudder=0.5,prop=0.5,engine=0.4,oil=0.6,crack=1,nosegear=0,lsnap=3.4,rfold=3.2,tail=2.0]");
                 std::process::exit(0);
             }
             other => {
@@ -510,6 +518,13 @@ fn parse_args() -> Args {
         i += used;
     }
     a.shots.sort_by(|x, y| x.0.total_cmp(&y.0));
+    if a.crashtest.is_some() && !given_place {
+        // The Bonneville Salt Flats: flat as a table for miles, nothing to hit but the wall.
+        (a.lat, a.lon, a.heading) = (40.7600, -113.8900, 90.0);
+    }
+    if a.crashtest.is_some() && a.agl.is_none() && a.alt.is_none() {
+        a.agl = Some(2.0);
+    }
     a
 }
 
@@ -594,6 +609,14 @@ struct Game {
     seat: Seat,
     seat_next: Option<Seat>,
     drive_at: Option<String>,
+    /// the crash test: on, and where the car starts (position, heading, speed) once placed
+    crashtest: bool,
+    crash_start: Option<(DVec3, f64, f64)>,
+    /// when to write the crash test's report (car time of the first hard hit + 1 s)
+    crash_report_at: Option<f64>,
+    /// time runs at this rate (O: slow motion), and the physics overlay (F4)
+    slowmo: f64,
+    debug_overlay: bool,
     garage: vehicle::Garage,
     pilot: pilot::Pilot,
     car_acc: f64,
@@ -883,7 +906,7 @@ impl Game {
         let mut g = Self {
             gkey: src.google.key(), gkey_show: false, gm_logo: None, stills: vec![None; aircraft::ALL.len()], window, r, world, src, spec, model, piece_mesh, group_mesh, piece_cut, group_pivots, hangar: Vec::new(), building: Vec::new(), crashed: false, crash: None, crash_real: 0.0, egui_ctx, egui_state, keys: HashSet::new(), drag: false, last_cursor: None,
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { 0 }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
-            utc: (hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, seat: Seat::Plane, seat_next: None, drive_at: args.drive.clone(), garage: vehicle::Garage::default(), pilot: pilot::Pilot::new(), car_acc: 0.0, cam_blend: None, last_view: (cam_pos, DVec3::X), wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], taa: args.taa, prev_plane: Mat4::IDENTITY, plane_box,
+            utc: (hour - lon / 15.0).rem_euclid(24.0), doy: args.day.unwrap_or(doy), wx, time: 0.0, real: 0.0, last: Instant::now(), acc: 0.0, seat: Seat::Plane, seat_next: None, drive_at: args.drive.clone().or(args.crashtest.clone()), crashtest: args.crashtest.is_some(), crash_start: None, crash_report_at: None, slowmo: 1.0, debug_overlay: args.crashtest.is_some(), garage: vehicle::Garage::default(), pilot: pilot::Pilot::new(), car_acc: 0.0, cam_blend: None, last_view: (cam_pos, DVec3::X), wave_off: DVec2::ZERO, shore: shore::Shore::default(), ocean_off: DVec2::ZERO, prev_cam: cam_pos, prev_vp: [[0.0; 4]; 4], taa: args.taa, prev_plane: Mat4::IDENTITY, plane_box,
             frame: 0, fps: 60.0, paused: false, show_help: false, show_hud: !args.no_hud, goto_open: false, goto_text: String::new(), goto_rx: None,
             status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, boost_at: args.boost_at, hold: args.hold, gilrs: open_gamepads(), pad: Controls::default(), pad_id: None, pad_fixed: Vec::new(), pad_events: Vec::new(), pad_move: None, pad_skip: None, pad_rep: None, pad_home: false, parking_brake: false, cam_home: (cy.to_radians(), cp), rng: crash::Rng(secs.to_bits() | 1),
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
@@ -1522,6 +1545,12 @@ impl Game {
             KeyCode::Escape if self.show_help => self.show_help = false,
             KeyCode::Escape if self.wx.open => self.wx.open = false,
             KeyCode::Escape => self.set_pause_menu(true),
+            KeyCode::KeyR if self.crashtest && self.crash_start.is_some() => self.crash_reset(),
+            KeyCode::KeyO => {
+                self.slowmo = if self.slowmo > 0.5 { 0.25 } else if self.slowmo > 0.2 { 0.1 } else { 1.0 };
+                self.hint(&format!("Time x{}", self.slowmo), 1.5);
+            }
+            KeyCode::F4 => self.debug_overlay = !self.debug_overlay,
             KeyCode::KeyR => {
                 self.seat = Seat::Plane;
                 self.seat_next = None;
@@ -2184,7 +2213,7 @@ impl Game {
             }
         }
         let scale = if self.paused || in_menu || self.pause_open || self.real < self.hold { 0.0 } else { 1.0 };
-        let dt = dt_real * scale;
+        let dt = dt_real * scale * self.slowmo;
         self.time += dt;
         if !in_menu {
             self.career_tick(dt);
@@ -4480,6 +4509,71 @@ impl Game {
                     });
                 });
             }
+            if self.debug_overlay && !self.garage.cars.is_empty() {
+                // The physics as the car sees it: hull points (red where touching), the
+                // surface normals they push along, the wheels' contacts and springs, the velocity.
+                let ci = if let Seat::Car(i) = self.seat { i } else { 0 };
+                let c = &self.garage.cars[ci];
+                let (vp, vcam) = self.view;
+                let scr = ctx.content_rect();
+                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("physics overlay")));
+                let to_screen = |p: DVec3| -> Option<egui::Pos2> {
+                    let q = vp * (p - vcam).as_vec3().extend(1.0);
+                    if q.w <= 0.0 {
+                        return None;
+                    }
+                    Some(egui::pos2(scr.left() + (q.x / q.w * 0.5 + 0.5) * scr.width(), scr.top() + (0.5 - q.y / q.w * 0.5) * scr.height()))
+                };
+                let line = |a: DVec3, b: DVec3, col: Color32, w: f32| {
+                    if let (Some(a), Some(b)) = (to_screen(a), to_screen(b)) {
+                        painter.line_segment([a, b], egui::Stroke::new(w, col));
+                    }
+                };
+                let touching: Vec<DVec3> = c.debug.contacts.iter().map(|x| x.0).collect();
+                for p in c.hull_points() {
+                    let hot = touching.iter().any(|t| (*t - p).length() < 0.05);
+                    if let Some(s) = to_screen(p) {
+                        painter.circle_filled(s, if hot { 4.5 } else { 2.5 }, if hot { Color32::from_rgb(255, 60, 50) } else { Color32::from_rgb(90, 230, 120) });
+                    }
+                }
+                for (p, n) in &c.debug.contacts {
+                    line(*p, *p + *n * 0.8, Color32::from_rgb(255, 200, 60), 1.5);
+                }
+                for w in 0..4 {
+                    let (len, rest, grounded, lost) = c.wheel(w);
+                    if lost {
+                        continue;
+                    }
+                    if let Some(at) = c.debug.wheel_at[w] {
+                        // The spring: green at rest, red near the bump stop.
+                        let squeeze = ((rest - len) / rest).clamp(0.0, 1.0) as f32;
+                        let col = Color32::from_rgb((80.0 + 175.0 * squeeze) as u8, (230.0 - 170.0 * squeeze) as u8, 90);
+                        line(at, at + c.up() * (len + 0.3), col, 3.0);
+                        if let Some(s) = to_screen(at) {
+                            painter.circle_stroke(s, 6.0, egui::Stroke::new(2.0, if grounded { col } else { Color32::GRAY }));
+                        }
+                    }
+                }
+                line(c.pos, c.pos + c.vel * 0.25, Color32::from_rgb(90, 170, 255), 2.5);
+                egui::Area::new(egui::Id::unique("physics panel")).anchor(Align2::RIGHT_TOP, [-14.0, 14.0]).show(ctx, |ui| {
+                    panel.show(ui, |ui| {
+                        shadow(ui, format!("{}  (F4)", c.kind.key), 14.0, white);
+                        shadow(ui, format!("speed {:>5.1} m/s  {:>4.0} km/h", c.speed(), c.speed() * 3.6), 13.0, white);
+                        shadow(ui, format!("g {:>5.1}   peak {:>5.1}", c.debug.g, c.debug.g_peak), 13.0, white);
+                        shadow(ui, format!("damage {:>3.0}%  dent {:.2} m", c.damage * 100.0, c.deepest_dent()), 13.0, white);
+                        shadow(ui, format!("glass {}  wheels off {}", c.debug.glass_broken, c.wheels_lost()), 13.0, dim);
+                        for w in 0..4 {
+                            let (len, rest, grounded, lost) = c.wheel(w);
+                            let name = ["FL", "FR", "RL", "RR"][w];
+                            shadow(ui, if lost { format!("{name} gone") } else { format!("{name} spring {:>3.0}%{}", (rest - len) / rest * 100.0, if grounded { "" } else { "  air" }) }, 12.0, dim);
+                        }
+                        shadow(ui, format!("contacts {}   time x{}", c.debug.contacts.len(), self.slowmo), 12.0, dim);
+                        for (t, kind, v) in c.debug.hits.iter().rev().take(5) {
+                            shadow(ui, format!("{:>6.2}s {:?} {:.1} m/s", t, kind, v), 12.0, dim);
+                        }
+                    });
+                });
+            }
             if self.show_hud && self.seat == Seat::Plane {
                 egui::Area::new(egui::Id::unique("hud")).anchor(Align2::LEFT_TOP, [14.0, 14.0]).show(ctx, |ui| {
                     panel.show(ui, |ui| {
@@ -5267,7 +5361,12 @@ impl Game {
             let (key, speed) = what.split_once('@').map(|(k, v)| (k.to_string(), v.parse::<f64>().unwrap_or(0.0))).unwrap_or((what.clone(), 0.0));
             let p = self.plane.pos;
             let (la, lo, _) = geo::pos_to_lla(p);
-            let ready = self.world.ground(la, lo).is_some() && (speed <= 0.0 || !self.world.footprints_near_ids(p, 80.0).is_empty() || self.time > 30.0);
+            if self.crashtest && self.time > 8.0 && self.world.ground(la, lo).is_none() {
+                // No map data (offline): a flat world, so the test still runs.
+                self.world.flat = Some(0.0);
+                self.world.force_flat = true;
+            }
+            let ready = self.world.ground(la, lo).is_some() && (speed <= 0.0 || self.crashtest || !self.world.footprints_near_ids(p, 80.0).is_empty() || self.time > 30.0);
             if ready {
                 self.drive_at = None;
                 let fwd = self.plane.forward();
@@ -5282,6 +5381,15 @@ impl Game {
                         self.garage.cars[i].vel = flat * speed;
                         self.seat = Seat::Car(i);
                         self.pilot.shown = false;
+                        if self.crashtest {
+                            // A concrete wall 40 m ahead, square across the car's path.
+                            let start = self.garage.cars[i].origin();
+                            let u = start.normalize();
+                            let wall = vehicle::Wall::new(start + flat * 40.0 + u * 1.5, DQuat::from_mat3(&glam::DMat3::from_cols(flat.cross(u), u, flat)), DVec3::new(7.0, 1.5, 0.6));
+                            self.garage.walls = vec![wall];
+                            self.crash_start = Some((start, heading, speed));
+                            self.hint("Crash test: R runs it again, O slow motion, F4 the physics overlay", 6.0);
+                        }
                     }
                     None => {
                         self.pilot.get_out(at, at, heading, &self.world);
@@ -5302,6 +5410,7 @@ impl Game {
         let driven = if let Seat::Car(i) = self.seat { Some(i) } else { None };
         let drive = vehicle::Drive { throttle: fwd, steer: side, handbrake: k(KeyCode::Space) };
         let mut hits = Vec::new();
+        self.garage.begin_frame();
         if !self.garage.cars.is_empty() {
             self.car_acc = (self.car_acc + dt).min(0.1);
             let h = 1.0 / 120.0;
@@ -5339,6 +5448,7 @@ impl Game {
                 }
             }
         }
+        self.crash_test_report(&hits);
         if hits.is_empty() {
             return;
         }
@@ -5360,6 +5470,41 @@ impl Game {
                     self.bring_down(tile, idx, hit.pos, vel, None, femit);
                 }
             }
+        }
+    }
+
+    /// The crash test again from the start, the car as new.
+    fn crash_reset(&mut self) {
+        let Some((at, heading, speed)) = self.crash_start else { return };
+        if self.garage.cars.is_empty() {
+            return;
+        }
+        self.garage.reset(0, at, heading, &self.world);
+        let c = &mut self.garage.cars[0];
+        c.vel = c.forward() * speed;
+        self.seat = Seat::Car(0);
+        self.crash_report_at = None;
+        self.r.clear_particles();
+    }
+
+    /// A second after the crash test's first hard hit, what it did to the car (to the log).
+    fn crash_test_report(&mut self, hits: &[vehicle::Hit]) {
+        if !self.crashtest || self.garage.cars.is_empty() {
+            return;
+        }
+        if self.crash_report_at.is_none() && hits.iter().any(|h| h.speed > 5.0 && h.kind != vehicle::HitKind::Scrape) {
+            self.crash_report_at = Some(self.time + 1.0);
+        }
+        if self.crash_report_at.is_some_and(|t| self.time > t) {
+            self.crash_report_at = Some(f64::INFINITY);
+            let c = &self.garage.cars[0];
+            let impact = c.debug.hits.iter().map(|h| h.2).fold(0.0, f64::max);
+            let (start, ..) = self.crash_start.unwrap_or((c.pos, 0.0, 0.0));
+            let travelled = (c.origin() - start).length();
+            log::info!(
+                "crash test {}: hardest hit {:.1} m/s, peak {:.0} g, damage {:.0}%, deepest dent {:.2} m, {} glass triangles burst, {} wheels off, {:.1} m from the start, now {:.1} m/s, upright {:.2}",
+                c.kind.key, impact, c.debug.g_peak, c.damage * 100.0, c.deepest_dent(), c.debug.glass_broken, c.wheels_lost(), travelled, c.speed(), c.up().dot(c.pos.normalize())
+            );
         }
     }
 

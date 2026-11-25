@@ -109,7 +109,7 @@ pub struct Hit {
     pub speed: f64,
     pub kind: HitKind,
 }
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 pub enum HitKind {
     Ground,
     Scrape,
@@ -117,6 +117,47 @@ pub enum HitKind {
     Car,
     Glass,
     Wheel,
+    /// a test wall (`Garage::walls`)
+    Wall,
+}
+
+/// A solid box that cars hit: the crash test's wall. Its own frame: x across, y up, z through it.
+pub struct Wall {
+    pub center: DVec3,
+    pub rot: DQuat,
+    pub half: DVec3,
+    mesh: Option<usize>,
+}
+impl Wall {
+    pub fn new(center: DVec3, rot: DQuat, half: DVec3) -> Wall {
+        Wall { center, rot, half, mesh: None }
+    }
+    /// Inside? Then the way out through the nearest face, and how deep.
+    fn inside(&self, p: DVec3) -> Option<(DVec3, f64)> {
+        let q = self.rot.inverse() * (p - self.center);
+        let d = self.half - q.abs();
+        if d.min_element() <= 0.0 {
+            return None;
+        }
+        let (axis, depth) = if d.x <= d.y && d.x <= d.z { (DVec3::X * q.x.signum(), d.x) } else if d.y <= d.z { (DVec3::Y * q.y.signum(), d.y) } else { (DVec3::Z * q.z.signum(), d.z) };
+        Some((self.rot * axis, depth))
+    }
+}
+
+/// What the physics did lately, for the F4 overlay and the crash test's report.
+#[derive(Default)]
+pub struct Debug {
+    /// hull points touching something this frame: where, the surface's normal
+    pub contacts: Vec<(DVec3, DVec3)>,
+    /// where each wheel meets the ground
+    pub wheel_at: [Option<DVec3>; 4],
+    /// deceleration now and the most since the last reset (g, over 1/30 s)
+    pub g: f64,
+    pub g_peak: f64,
+    /// the last hits: when (car time), what, speed lost
+    pub hits: Vec<(f64, HitKind, f64)>,
+    pub glass_broken: usize,
+    vel_hist: [DVec3; 4],
 }
 
 // ---------------------------------------------------------------- the model
@@ -208,6 +249,8 @@ fn load(bytes: &[u8]) -> Shape {
 /// A car's own copy of a mesh, dented as it crashes.
 struct Skin {
     v: Vec<PartVertex>,
+    /// as it came from the model, for a reset
+    orig_i: Vec<u32>,
     rest: Vec<Vec3>,
     i: Vec<u32>,
     /// on the GPU once first drawn
@@ -218,7 +261,7 @@ struct Skin {
 }
 impl Skin {
     fn new(p: &Part) -> Skin {
-        Skin { v: p.v.clone(), rest: p.v.iter().map(|v| Vec3::from(v.pos)).collect(), i: p.i.clone(), mesh: None, dirty: None, idx_dirty: false }
+        Skin { v: p.v.clone(), orig_i: p.i.clone(), rest: p.v.iter().map(|v| Vec3::from(v.pos)).collect(), i: p.i.clone(), mesh: None, dirty: None, idx_dirty: false }
     }
     fn upload(&mut self, r: &mut Renderer) -> usize {
         match self.mesh {
@@ -279,6 +322,7 @@ pub struct Car {
     dent_cool: f64,
     /// how long it has been lying on its side or roof, nearly still
     stuck: f64,
+    pub debug: Debug,
 }
 
 /// Every car in the world, and the models they share.
@@ -287,6 +331,7 @@ pub struct Garage {
     shapes: Vec<Option<Shape>>,
     wheel_mesh: Vec<Option<[usize; 4]>>,
     pub cars: Vec<Car>,
+    pub walls: Vec<Wall>,
 }
 
 impl Garage {
@@ -367,8 +412,31 @@ impl Garage {
             scrape: 0.0,
             dent_cool: 0.0,
             stuck: 0.0,
+            debug: Debug::default(),
         });
         self.cars.len() - 1
+    }
+
+    /// The start of a frame: forget last frame's contacts.
+    pub fn begin_frame(&mut self) {
+        for c in &mut self.cars {
+            c.debug.contacts.clear();
+        }
+    }
+
+    /// Car `i` as new again, at `at` facing `heading` (its GPU meshes are reused).
+    pub fn reset(&mut self, i: usize, at: DVec3, heading: f64, world: &World) {
+        let k = self.cars[i].kind_index();
+        let (bm, gm) = (self.cars[i].body.mesh, self.cars[i].glass.mesh);
+        self.spawn(k, at, heading, world);
+        let mut c = self.cars.pop().unwrap();
+        for (s, m) in [(&mut c.body, bm), (&mut c.glass, gm)] {
+            s.mesh = m;
+            s.i = s.orig_i.clone();
+            s.dirty = Some((0, s.v.len()));
+            s.idx_dirty = true;
+        }
+        self.cars[i] = c;
     }
 
     /// One physics step for every car (`drive` is for car `driven`, the rest coast with the handbrake on).
@@ -376,7 +444,7 @@ impl Garage {
         let n = self.cars.len();
         for i in 0..n {
             let d = if Some(i) == driven { drive } else { Drive { throttle: 0.0, steer: 0.0, handbrake: true } };
-            self.cars[i].step(h, d, world, hits);
+            self.cars[i].step(h, d, world, &self.walls, hits);
         }
         // Car against car: each a row of three spheres along its length.
         for a in 0..n {
@@ -395,6 +463,14 @@ impl Garage {
                 let s = self.shapes[k].as_ref().unwrap();
                 self.wheel_mesh[k] = Some([0, 1, 2, 3].map(|w| r.add_mesh(&s.wheels[w].v, &s.wheels[w].i)));
             }
+        }
+        for w in &mut self.walls {
+            let m = *w.mesh.get_or_insert_with(|| {
+                let (v, i) = box_mesh(w.half.as_vec3(), [0.42, 0.41, 0.39]);
+                r.add_mesh(&v, &i)
+            });
+            let model = Mat4::from_rotation_translation(w.rot.as_quat(), (w.center - cam).as_vec3());
+            objs.push(DrawObj { mesh: m, model, glow: [0.0, SHADER_KIND, 0.0, 0.0], cast: 0b11, ..DrawObj::DEFAULT });
         }
         for (ci, c) in self.cars.iter_mut().enumerate() {
             let wm = self.wheel_mesh[c.kind_index()].unwrap();
@@ -418,7 +494,22 @@ impl Garage {
 }
 
 impl Car {
-    fn kind_index(&self) -> usize {
+    /// The hull points (planet frame).
+    pub fn hull_points(&self) -> Vec<DVec3> {
+        self.hull.iter().map(|h| self.pos + self.rot * *h).collect()
+    }
+    /// Per wheel: suspension length, its rest length, on the ground, come off.
+    pub fn wheel(&self, w: usize) -> (f64, f64, bool, bool) {
+        (self.len[w], self.rest, self.grounded[w], self.lost[w])
+    }
+    pub fn wheels_lost(&self) -> usize {
+        self.lost.iter().filter(|l| **l).count()
+    }
+    /// How far the most crumpled vertex of the body has moved (m).
+    pub fn deepest_dent(&self) -> f32 {
+        self.body.v.iter().zip(&self.body.rest).map(|(v, r)| (Vec3::from(v.pos) - *r).length()).fold(0.0, f32::max)
+    }
+    pub fn kind_index(&self) -> usize {
         KINDS.iter().position(|k| std::ptr::eq(k, self.kind)).unwrap_or(0)
     }
     pub fn forward(&self) -> DVec3 {
@@ -480,7 +571,7 @@ impl Car {
         -vn
     }
 
-    fn step(&mut self, h: f64, d: Drive, world: &World, hits: &mut Vec<Hit>) {
+    fn step(&mut self, h: f64, d: Drive, world: &World, walls: &[Wall], hits: &mut Vec<Hit>) {
         self.time += h;
         self.dent_cool -= h;
         let kind = self.kind;
@@ -534,6 +625,7 @@ impl Car {
                 // In the air: the wheel hangs at full droop.
                 self.len[w] += (max_len - self.len[w]) * (h * 12.0).min(1.0);
                 self.grounded[w] = false;
+                self.debug.wheel_at[w] = None;
                 self.spin_w[w] *= 1.0 - h * 0.3;
                 self.spin[w] += self.spin_w[w] * h;
                 continue;
@@ -543,6 +635,7 @@ impl Car {
             self.len[w] = len;
             self.grounded[w] = true;
             let contact = top + bdown * (len + self.radius[w]);
+            self.debug.wheel_at[w] = Some(contact);
             let r = contact - self.pos;
             let mut nf = self.k * (self.rest - len) - self.c * rate;
             // The anti-roll bar: the wheel opposite pressed further in pushes this one down too.
@@ -621,6 +714,7 @@ impl Car {
             }
             let vn = self.impulse(p, normal, 0.15, 0.55);
             self.pos += normal * (depth * 0.6).min(0.2);
+            self.debug.contacts.push((p, normal));
             let slide = (self.vel + self.w.cross(p - self.pos)).reject_from(normal).length();
             if slide > 2.0 {
                 self.scrape = self.scrape.max((slide / 20.0).min(1.0) as f32);
@@ -631,6 +725,28 @@ impl Car {
             if vn > 3.5 {
                 self.dent(p, normal, vn, HitKind::Ground, hits);
             }
+        }
+        // The hull against the test walls.
+        for k in 0..self.hull.len() {
+            let p = self.pos + self.rot * self.hull[k];
+            for wall in walls {
+                if let Some((nrm, depth)) = wall.inside(p) {
+                    let vn = self.impulse(p, nrm, 0.12, 0.35);
+                    self.pos += nrm * (depth * 0.8).min(0.5);
+                    self.debug.contacts.push((p, nrm));
+                    if vn > 2.0 {
+                        self.dent(p, nrm, vn, HitKind::Wall, hits);
+                    }
+                }
+            }
+        }
+        // The g meter: the change in velocity over the last four steps.
+        let old = self.debug.vel_hist[0];
+        self.debug.vel_hist.rotate_left(1);
+        self.debug.vel_hist[3] = self.vel;
+        self.debug.g = (self.vel - old).length() / (4.0 * h) / 9.81;
+        if self.time > 0.5 {
+            self.debug.g_peak = self.debug.g_peak.max(self.debug.g);
         }
         // On its roof or side and nearly still for a while: back onto its wheels (the marshals' job).
         if self.up().dot(up) < 0.3 && self.speed() < 1.0 {
@@ -671,6 +787,7 @@ impl Car {
                     let nrm = (e * out.x + n * out.y).normalize();
                     let vn = self.impulse(p, nrm, 0.12, 0.35);
                     self.pos += nrm * (depth * 0.8).min(0.5);
+                    self.debug.contacts.push((p, nrm));
                     if vn > 2.0 {
                         self.dent(p, nrm, vn, HitKind::Building(id.0, id.1, area), hits);
                     }
@@ -697,6 +814,12 @@ impl Car {
     /// normal there (pointing out of the obstacle), and the speed lost.
     fn dent(&mut self, at: DVec3, normal: DVec3, dv: f64, kind: HitKind, hits: &mut Vec<Hit>) {
         hits.push(Hit { pos: at, normal, speed: dv, kind });
+        if self.debug.hits.last().is_none_or(|l| self.time - l.0 > 0.05 || l.1 != kind) {
+            self.debug.hits.push((self.time, kind, dv));
+            if self.debug.hits.len() > 8 {
+                self.debug.hits.remove(0);
+            }
+        }
         if self.dent_cool > 0.0 && dv < 8.0 {
             return;
         }
@@ -760,6 +883,7 @@ impl Car {
             }
         }
         if broke > 0 {
+            self.debug.glass_broken += broke;
             hits.push(Hit { pos: at, normal, speed: dv as f64, kind: HitKind::Glass });
         }
         // A wheel hit hard enough comes off.
@@ -886,6 +1010,27 @@ pub fn footprints(world: &World, p: DVec3, r: f64) -> Vec<(Vec<DVec3>, f64, f64,
     world.footprints_near_ids(p, r)
 }
 
+/// A box (half extents) of rough painted concrete.
+fn box_mesh(h: Vec3, col: [f32; 3]) -> (Vec<PartVertex>, Vec<u32>) {
+    let (mut v, mut i) = (Vec::new(), Vec::new());
+    for axis in 0..3 {
+        for s in [-1.0f32, 1.0] {
+            let mut n = Vec3::ZERO;
+            n[axis] = s;
+            let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
+            let b = v.len() as u32;
+            for (a, c) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                let mut p = n * h;
+                p[u] = a * h[u];
+                p[w] = c * h[w];
+                v.push(PartVertex { pos: p.into(), nrm: n.into(), col: [col[0], col[1], col[2], 1.0], uv: [0.0; 2], mat: [mat::PLASTIC, 0.0, 0.0, 0.0] });
+            }
+            if s > 0.0 { i.extend([b, b + 1, b + 2, b, b + 2, b + 3]) } else { i.extend([b, b + 2, b + 1, b, b + 3, b + 2]) }
+        }
+    }
+    (v, i)
+}
+
 fn hash(x: u32) -> f32 {
     let mut h = x.wrapping_mul(0x9E37_79B9) ^ 0x85EB_CA6B;
     h ^= h >> 15;
@@ -1002,6 +1147,30 @@ mod tests {
         let moved = c.body.v.iter().zip(&c.body.rest).map(|(v, r)| (Vec3::from(v.pos) - *r).length()).fold(0.0f32, f32::max);
         println!("deepest dent {moved:.2} m, damage {:.2}", c.damage);
         assert!(moved > 0.05 && moved <= 0.76);
+    }
+
+    #[test]
+    fn into_a_wall_and_reset() {
+        let w = flat_world();
+        let mut g = Garage::default();
+        let p = geo::lla_to_pos(0.6, -2.1, 0.0);
+        let (_, n, u) = geo::enu(p);
+        g.spawn(0, p, 0.0, &w);
+        // A wall 30 m ahead, across the road.
+        let rot = DQuat::from_mat3(&DMat3::from_cols(n.cross(u), u, -n));
+        g.walls.push(Wall::new(p + n * 30.0 + u * 1.5, rot, DVec3::new(6.0, 1.5, 0.5)));
+        run(&mut g, &w, 1.0, Drive::default());
+        g.cars[0].vel = n * 25.0;
+        let hits = run(&mut g, &w, 3.0, Drive::default());
+        let c = &g.cars[0];
+        let front = (c.pos - p).dot(n) + c.length() / 2.0;
+        println!("stopped {front:.2} m along (wall face at 29.5), peak {:.0} g, damage {:.2}, dent {:.2} m, glass {}", c.debug.g_peak, c.damage, c.deepest_dent(), c.debug.glass_broken);
+        assert!(hits.iter().any(|h| h.kind == HitKind::Wall && h.speed > 15.0), "no hard hit on the wall");
+        assert!(front < 30.6, "went through the wall: nose at {front:.2} m");
+        assert!(c.debug.g_peak > 10.0, "a 90 km/h wall hit at {:.0} g", c.debug.g_peak);
+        assert!(c.deepest_dent() > 0.2, "barely dented");
+        g.reset(0, p, 0.0, &w);
+        assert!(g.cars[0].deepest_dent() < 1e-6 && g.cars[0].damage == 0.0 && g.cars.len() == 1);
     }
 
     #[test]

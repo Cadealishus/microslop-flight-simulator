@@ -80,6 +80,8 @@ The first run on Windows or Mac builds the game from this source code, which tak
 
 **On foot:** W / S walk forward / back, A / D turn, Shift run, 1 / 2 call a Raptor / Countach, Enter get in. **Driving:** W gas, S brake and reverse, A / D steer, Space handbrake, C inside or chase view, mouse drag look around, Enter get out (below 15 km/h).
 
+**Crash testing:** `--crashtest raptor@25` (or `countach@40`, any speed in m/s) puts the car on the Bonneville Salt Flats driving at a concrete wall 40 m ahead, the same crash every time. R runs it again with the car as new, O cycles slow motion (x1, x0.25, x0.1), F4 shows the physics overlay (the car's collision points, red where they touch, the normals they push along, the wheels' springs, the velocity, g-force and the last hits). A second after the impact the game writes a report to its log: the hardest hit, peak g, damage, deepest dent, glass burst, wheels lost and the rebound. Without map data (offline) the test runs on flat ground.
+
 # Multiplayer
 
 1. One player opens the pause menu (Esc), goes to **Multiplayer** and clicks **Host a room**. A 5-letter code appears.

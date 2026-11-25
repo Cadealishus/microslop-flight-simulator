@@ -177,6 +177,8 @@ const LOD_FINE: f32 = 700.0;
 pub struct World {
     /// flat ground everywhere tiles have not loaded, at this height (for tests)
     pub flat: Option<f64>,
+    /// the crash test without map data: flat ground and no buildings, whatever loads
+    pub force_flat: bool,
     loader: Loader,
     tiles: HashMap<TileId, Slot>,
     builds: HashMap<TileId, BSlot>,
@@ -223,13 +225,16 @@ impl Frustum {
 impl World {
     pub fn new(loader: Loader, max_zoom: u8) -> Self {
         let photo = Some(Box::new(crate::tiles3d::Photo::new(loader.src.google.clone(), Some(loader.src.clone()))));
-        Self { photo, flat: None, loader, tiles: HashMap::new(), builds: HashMap::new(), frame: 0, in_flight: 0, max_zoom, lod_k: 0.62, buildings_on: true, draw: Vec::new(), draw_shore: Vec::new(), draw_b: Vec::new(), wanted: Vec::new(), in_view: Vec::new(), frustum: None, craters: Vec::new(), tree_dims: Vec::new(), tick: 0, stats: (0, 0, 0), last_update: None, uploads: VecDeque::new(), fields: HashMap::new(), ocean: crate::ocean::Ocean::new() }
+        Self { photo, flat: None, force_flat: false, loader, tiles: HashMap::new(), builds: HashMap::new(), frame: 0, in_flight: 0, max_zoom, lod_k: 0.62, buildings_on: true, draw: Vec::new(), draw_shore: Vec::new(), draw_b: Vec::new(), wanted: Vec::new(), in_view: Vec::new(), frustum: None, craters: Vec::new(), tree_dims: Vec::new(), tick: 0, stats: (0, 0, 0), last_update: None, uploads: VecDeque::new(), fields: HashMap::new(), ocean: crate::ocean::Ocean::new() }
     }
 
     /// Height of the ground (or water surface) at a lat/lon: the top of the
     /// photorealistic 3D mesh inside its zone (buildings included), our own
     /// terrain everywhere else.
     pub fn ground(&self, lat: f64, lon: f64) -> Option<Ground> {
+        if self.force_flat {
+            return self.flat.map(|h| Ground { h, water: false });
+        }
         let g = self.terrain_ground(lat, lon);
         if let Some(mut h) = self.photo.as_deref().and_then(|p| p.ground(lat, lon, g.as_ref().map(|g| g.h))) {
             // Our water (the mesh's is a still photograph): ditching floats on it.
@@ -452,7 +457,7 @@ impl World {
 
     /// Building or bridge deck over a lat/lon.
     pub fn building(&self, lat: f64, lon: f64) -> Option<BHit> {
-        if self.hidden(lat, lon) {
+        if self.hidden(lat, lon) || self.force_flat {
             return None;
         }
         self.footprint_at(lat, lon)
@@ -679,7 +684,7 @@ impl World {
     /// As `footprints_near`, with which building each is (to bring it down) and its area.
     pub fn footprints_near_ids(&self, p: DVec3, r: f64) -> Vec<(Vec<DVec3>, f64, f64, bool, (TileId, usize), f32)> {
         let (lat, lon, _) = geo::pos_to_lla(p);
-        if self.hidden(lat, lon) {
+        if self.hidden(lat, lon) || self.force_flat {
             return Vec::new();
         }
         let c = TileId::at(lat, lon, DATA_ZOOM);
