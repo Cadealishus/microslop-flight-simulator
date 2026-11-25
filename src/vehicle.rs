@@ -1216,6 +1216,7 @@ impl Car {
         }
         let sk = self.skinning.clone();
         let lat = &self.lattice;
+        let bends = lat.bends();
         let mut skins: Vec<(&mut Skin, bool)> = vec![(&mut self.body, true), (&mut self.glass, true)];
         for p in &mut self.parts {
             // (A part hanging open or gone no longer follows the body.)
@@ -1229,11 +1230,11 @@ impl Car {
             }
             let mut touched: Option<(usize, usize)> = None;
             for k in 0..s.v.len() {
-                let (np, moved) = sk[m].place(lat, k, s.rest[k]);
+                let (np, bend, moved) = sk[m].place(lat, &bends, k, s.rest[k]);
                 if !moved {
                     continue;
                 }
-                let (pos, nrm, col, metal) = crumple(s.rest[k], np, s.nrm0[k], s.col0[k], s.v[k].mat[0]);
+                let (pos, nrm, col, metal) = crumple(s.rest[k], np, bend, s.nrm0[k], s.col0[k], s.v[k].mat[0]);
                 s.v[k].pos = pos.into();
                 s.v[k].nrm = nrm.into();
                 s.v[k].col = col;
@@ -1596,26 +1597,27 @@ fn vnoise(p: Vec3) -> f32 {
 }
 
 /// How a vertex of sheet metal looks once the structure under it has moved it
-/// from `rest` to `to`: its position, normal, colour and whether its paint has
-/// flaked to bare metal.
+/// from `rest` to `to`, the structure there bent by `bend` (m of yield): its
+/// position, normal, colour and whether its paint has flaked to bare metal.
 ///
-/// Pushed along its surface, metal does not just slide: it buckles into folds
-/// across the push, an accordion of sharp ridges about 13 cm apart, deeper the
-/// further it was pushed. The ridges wander (their phase follows smooth noise),
+/// Metal that has only been carried along (a cab shoved back whole) is just
+/// moved. Where the structure under it has bent, and pushed along its surface,
+/// it buckles into folds across the push, an accordion of sharp ridges about
+/// 13 cm apart, deeper the more it bent. The ridges wander (their phase follows smooth noise),
 /// and the normal is tilted by the slope of the fold, so each crease catches the
 /// light on one side and falls dark on the other. Pushed straight in, it dents,
 /// with a little smooth unevenness. Badly crushed paint cracks off.
-fn crumple(rest: Vec3, to: Vec3, n0: Vec3, col0: [f32; 4], id: f32) -> (Vec3, Vec3, [f32; 4], bool) {
+fn crumple(rest: Vec3, to: Vec3, bend: f32, n0: Vec3, col0: [f32; 4], id: f32) -> (Vec3, Vec3, [f32; 4], bool) {
     let d = to - rest;
     let off = d.length();
-    if off < 1e-4 {
+    if off < 1e-4 || bend < 0.004 {
         return (to, n0, col0, false);
     }
     let dir = d / off;
     // The part of the push that runs along the surface folds it.
     let along = (dir - n0 * dir.dot(n0)).normalize_or_zero();
     let sideways = 1.0 - dir.dot(n0).abs();
-    let amp = (off * 0.2).min(0.055) * (0.25 + 0.75 * sideways);
+    let amp = (bend * 0.45).min(0.055) * (0.25 + 0.75 * sideways);
     const WAVE: f32 = 0.13;
     let phase = vnoise(rest * 2.3) * 2.0;
     let s = rest.dot(along) / WAVE + phase;
@@ -1627,14 +1629,14 @@ fn crumple(rest: Vec3, to: Vec3, n0: Vec3, col0: [f32; 4], id: f32) -> (Vec3, Ve
     let fold = 0.75 * tri + 0.25 * (s2 * std::f32::consts::TAU).sin();
     let slope = 0.75 * slope_tri + 0.25 * (s2 * std::f32::consts::TAU).cos() * std::f32::consts::TAU * 2.7 / WAVE;
     // And smooth unevenness everywhere it moved.
-    let bump = (vnoise(rest * 6.0) - 0.5) * (off * 0.25).min(0.04);
+    let bump = (vnoise(rest * 6.0) - 0.5) * (bend * 0.5).min(0.04);
     let pos = to + n0 * (amp * fold + bump);
     let nrm = (n0 - along * (amp * slope).clamp(-2.5, 2.5)).normalize_or_zero();
     // Paint cracks off where it is crushed hardest (in patches).
     let mut col = col0;
     let mut metal = false;
-    if id == mat::PAINT && off > 0.12 {
-        let k = ((off - 0.12) / 0.25).clamp(0.0, 1.0) * (vnoise(rest * 11.0) * 1.6 - 0.3).clamp(0.0, 1.0);
+    if id == mat::PAINT && bend > 0.05 {
+        let k = ((bend - 0.05) / 0.1).clamp(0.0, 1.0) * (vnoise(rest * 11.0) * 1.6 - 0.3).clamp(0.0, 1.0);
         let bare = [0.52, 0.52, 0.54];
         for c in 0..3 {
             col[c] = col0[c] + (bare[c] - col0[c]) * k;
@@ -1670,7 +1672,7 @@ pub fn particles(hits: &[Hit], rng: &mut Rng, out: &mut Vec<(DVec3, Particle)>) 
             HitKind::Smoke => {
                 // Grey from a hurt engine, dark from a dead one.
                 let dark = (s / 10.0).clamp(0.0, 1.0);
-                out.push((hit.pos, Particle { vel: (up * rng.range(1.0, 2.5) + Vec3::new(rng.range(-0.4, 0.4), rng.range(-0.4, 0.4), rng.range(-0.4, 0.4))).into(), life: rng.range(2.5, 4.5), size0: rng.range(0.25, 0.45), size1: rng.range(2.0, 3.5), kind: DUST, drag: 1.0, buoy: 1.2 + dark, seed: rng.f(), alpha: 0.25 + 0.35 * dark, ..Default::default() }));
+                out.push((hit.pos, Particle { vel: (up * rng.range(1.0, 2.5) + Vec3::new(rng.range(-0.4, 0.4), rng.range(-0.4, 0.4), rng.range(-0.4, 0.4))).into(), life: rng.range(2.0, 3.5), size0: rng.range(0.15, 0.3), size1: rng.range(1.0, 1.8), kind: DUST, drag: 1.0, buoy: 1.2 + dark, seed: rng.f(), alpha: 0.18 + 0.3 * dark, ..Default::default() }));
             }
             HitKind::Glass => {
                 for _ in 0..40 {

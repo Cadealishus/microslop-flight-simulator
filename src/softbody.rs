@@ -227,6 +227,19 @@ impl Lattice {
         out.into_iter().map(|x| x.1).collect()
     }
 
+    /// How bent the structure is at each node: the most any of its beams has
+    /// yielded (m of length gained or lost), or snapped (counted as 0.2 m).
+    pub fn bends(&self) -> Vec<f32> {
+        let mut b = vec![0.0f32; self.rest.len()];
+        for bm in &self.beams {
+            let x = if bm.broken { 0.2 } else { (bm.l0 - bm.lb).abs() };
+            for i in [bm.a as usize, bm.b as usize] {
+                b[i] = b[i].max(x);
+            }
+        }
+        b
+    }
+
     /// Beams that have yielded and that have snapped.
     pub fn stats(&self) -> (usize, usize) {
         (self.beams.iter().filter(|b| !b.broken && b.bent() > 0.05).count(), self.beams.iter().filter(|b| b.broken).count())
@@ -284,19 +297,22 @@ impl Skinning {
         Skinning { idx, w }
     }
 
-    /// Where vertex `k` (resting at `rest`) is now, and whether any of its nodes moved.
-    pub fn place(&self, l: &Lattice, k: usize, rest: Vec3) -> (Vec3, bool) {
+    /// Where vertex `k` (resting at `rest`) is now, how bent the structure under
+    /// it is (`bends`), and whether any of its nodes moved.
+    pub fn place(&self, l: &Lattice, bends: &[f32], k: usize, rest: Vec3) -> (Vec3, f32, bool) {
         let mut d = Vec3::ZERO;
+        let mut bend = 0.0;
         let mut moved = false;
         for j in 0..4 {
             let i = self.idx[k][j] as usize;
             let w = self.w[k][j];
             if w > 0.0 {
                 d += (l.pos[i] - l.rest[i]) * w;
+                bend += bends[i] * w;
                 moved |= l.dirty[i];
             }
         }
-        (rest + d, moved)
+        (rest + d, bend, moved)
     }
 
     pub fn len(&self) -> usize {
