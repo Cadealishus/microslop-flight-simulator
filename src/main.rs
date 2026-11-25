@@ -4497,12 +4497,12 @@ impl Game {
             }
             if self.show_hud && self.seat != Seat::Plane {
                 // On the road or on foot: a speedometer and what the keys do.
-                let (title, v, damage) = match self.seat {
+                let (title, v, damage, engine, pull) = match self.seat {
                     Seat::Car(i) => {
                         let c = &self.garage.cars[i];
-                        (c.kind.name, c.vel.dot(c.forward()), Some(c.damage))
+                        (c.kind.name, c.vel.dot(c.forward()), Some(c.damage), c.engine, c.pull())
                     }
-                    _ => ("On foot", 0.0, None),
+                    _ => ("On foot", 0.0, None, 1.0, 0.0),
                 };
                 egui::Area::new(egui::Id::unique("hud road")).anchor(Align2::LEFT_TOP, [14.0, 14.0]).show(ctx, |ui| {
                     panel.show(ui, |ui| {
@@ -4512,8 +4512,17 @@ impl Game {
                             if v < -0.5 {
                                 shadow(ui, "REVERSE".into(), 14.0, dim);
                             }
-                            let col = if d > 0.5 { Color32::from_rgb(240, 90, 70) } else { dim };
+                            let red = Color32::from_rgb(240, 90, 70);
+                            let col = if d > 0.5 { red } else { dim };
                             shadow(ui, format!("DAMAGE {:>3.0}%", d * 100.0), 14.0, col);
+                            if engine < 0.15 {
+                                shadow(ui, "ENGINE DEAD".into(), 14.0, red);
+                            } else if engine < 0.99 {
+                                shadow(ui, format!("ENGINE {:>3.0}%", engine * 100.0), 14.0, if engine < 0.4 { red } else { Color32::from_rgb(255, 200, 60) });
+                            }
+                            if pull.abs() > 0.015 {
+                                shadow(ui, format!("PULLS {}", if pull < 0.0 { "LEFT" } else { "RIGHT" }), 14.0, Color32::from_rgb(255, 200, 60));
+                            }
                         }
                     });
                 });
@@ -4597,8 +4606,10 @@ impl Game {
                         for w in 0..4 {
                             let (len, rest, grounded, lost) = c.wheel(w);
                             let name = ["FL", "FR", "RL", "RR"][w];
-                            shadow(ui, if lost { format!("{name} gone") } else { format!("{name} spring {:>3.0}%{}", (rest - len) / rest * 100.0, if grounded { "" } else { "  air" }) }, 12.0, dim);
+                            let knocked = if c.knock[w].length() > 0.02 { format!("  shoved {:.0} cm, toe {:+.1}°", c.knock[w].length() * 100.0, c.toe[w].to_degrees()) } else { String::new() };
+                            shadow(ui, if lost { format!("{name} gone") } else { format!("{name} spring {:>3.0}%{}{knocked}", (rest - len) / rest * 100.0, if grounded { "" } else { "  air" }) }, 12.0, dim);
                         }
+                        shadow(ui, format!("engine {:.0}%   pull {:+.1}°", c.engine * 100.0, c.pull().to_degrees()), 12.0, dim);
                         for (name, state, angle) in c.part_states() {
                             match state {
                                 vehicle::PartState::Swinging => shadow(ui, format!("{name} open {:.0}°", angle.to_degrees()), 12.0, Color32::from_rgb(255, 200, 60)),

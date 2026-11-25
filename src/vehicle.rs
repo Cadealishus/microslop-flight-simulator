@@ -131,6 +131,8 @@ pub enum HitKind {
     Wall,
     /// a part tore off (`Car::part_states`)
     Part,
+    /// a damaged engine smoking (speed: how badly)
+    Smoke,
 }
 
 /// A solid box that cars hit: the crash test's wall. Its own frame: x across, y up, z through it.
@@ -409,8 +411,9 @@ fn rb_impulse(pos: DVec3, vel: &mut DVec3, w: &mut DVec3, rot: DQuat, inertia: D
 /// A car's own copy of a mesh, dented as it crashes.
 struct Skin {
     v: Vec<PartVertex>,
-    /// the normals as built (crinkles are worked out from these)
+    /// the normals, colours and materials as built (crumples and flaked paint are worked out from these)
     nrm0: Vec<Vec3>,
+    col0: Vec<[f32; 4]>,
     /// as it came from the model, for a reset
     orig_i: Vec<u32>,
     rest: Vec<Vec3>,
@@ -426,7 +429,7 @@ impl Skin {
         Skin::new(&Part::empty())
     }
     fn new(p: &Part) -> Skin {
-        Skin { nrm0: p.v.iter().map(|v| Vec3::from(v.nrm)).collect(), v: p.v.clone(), orig_i: p.i.clone(), rest: p.v.iter().map(|v| Vec3::from(v.pos)).collect(), i: p.i.clone(), mesh: None, dirty: None, idx_dirty: false }
+        Skin { nrm0: p.v.iter().map(|v| Vec3::from(v.nrm)).collect(), col0: p.v.iter().map(|v| v.col).collect(), v: p.v.clone(), orig_i: p.i.clone(), rest: p.v.iter().map(|v| Vec3::from(v.pos)).collect(), i: p.i.clone(), mesh: None, dirty: None, idx_dirty: false }
     }
     fn upload(&mut self, r: &mut Renderer) -> usize {
         match self.mesh {
@@ -466,6 +469,22 @@ pub struct Car {
     lost: [bool; 4],
     /// the strut tops (body frame, from the centre of mass), wheel radius, rest length
     strut: [DVec3; 4],
+    /// the strut tops as built; how far the structure around each wheel has shoved
+    /// it (model frame); the toe that leaves it with (rad, + right), how far a bent
+    /// rim wobbles each turn (rad), how hard a bent wheel drags (0..1)
+    strut0: [DVec3; 4],
+    pub knock: [DVec3; 4],
+    pub toe: [f64; 4],
+    wobble: [f64; 4],
+    drag: [f64; 4],
+    /// each wheel's nearby nodes (and how much each counts), the engine bay's nodes
+    wheel_nodes: [Vec<(usize, f32)>; 4],
+    engine_nodes: Vec<usize>,
+    /// the engine (1 sound, 0 dead), the steering that is left (1 all), each wheel's steer as drawn
+    pub engine: f64,
+    steer_left: f64,
+    vis_steer: [f64; 4],
+    smoke_t: f64,
     radius: [f64; 4],
     rest: f64,
     k: f64,
@@ -567,6 +586,17 @@ impl Garage {
         let (body, glass) = (Skin::new(&s.body), Skin::new(&s.glass));
         let rest = kind.travel + sag;
         let (lattice, skinning) = (s.lattice.clone(), s.skinning.clone());
+        // The nodes that carry each wheel (within 0.8 m of its hub), and the engine
+        // bay's (ahead of the front axle, between the wheels, under the hood).
+        let wheel_nodes = [0, 1, 2, 3].map(|w| {
+            let hub = s.wheels[w].hub;
+            lattice.rest.iter().enumerate().filter_map(|(i, p)| {
+                let d = p.distance(hub);
+                (d < 0.8).then_some((i, 1.0 - d / 0.8))
+            }).collect::<Vec<_>>()
+        });
+        let axle = s.wheels[0].hub.z;
+        let engine_nodes: Vec<usize> = lattice.rest.iter().enumerate().filter(|(_, p)| p.z < axle + 0.25 && p.x.abs() < 0.75 && p.y > 0.3 && p.y < hi.y * 0.6).map(|(i, _)| i).collect();
         self.cars.push(Car {
             kind,
             pos,
@@ -580,6 +610,17 @@ impl Garage {
             grounded: [false; 4],
             lost: [false; 4],
             strut,
+            strut0: strut,
+            knock: [DVec3::ZERO; 4],
+            toe: [0.0; 4],
+            wobble: [0.0; 4],
+            drag: [0.0; 4],
+            wheel_nodes,
+            engine_nodes,
+            engine: 1.0,
+            steer_left: 1.0,
+            vis_steer: [0.0; 4],
+            smoke_t: 0.0,
             radius,
             rest,
             k: k_s,
@@ -760,8 +801,7 @@ impl Garage {
                     continue;
                 }
                 let hub = c.strut[w] + DVec3::new(0.0, c.kind.cg, 0.0) - DVec3::Y * c.len[w];
-                let steer = if w < 2 { c.steer } else { 0.0 };
-                let m = Mat4::from_translation(hub.as_vec3()) * Mat4::from_rotation_y(-steer as f32) * Mat4::from_rotation_x(-c.spin[w] as f32);
+                let m = Mat4::from_translation(hub.as_vec3()) * Mat4::from_rotation_y(-c.vis_steer[w] as f32) * Mat4::from_rotation_x(-c.spin[w] as f32);
                 objs.push(DrawObj { mesh: wm[w], model: base * m, ..o });
             }
         }
@@ -939,18 +979,18 @@ impl Car {
         force -= self.vel * (cda * v2.sqrt()) * if water { 25.0 } else { 1.0 };
         force -= self.up() * kind.down * v2;
         // Steering, lighter at speed.
-        let lock = kind.steer / (1.0 + v2.sqrt() / 12.0);
+        let lock = kind.steer / (1.0 + v2.sqrt() / 12.0) * self.steer_left;
         let want = d.steer * lock;
         self.steer += (want - self.steer).clamp(-2.4 * h, 2.4 * h);
         let fwd_speed = self.vel.dot(self.forward());
-        // Power falls with damage; a car with no wheels left has no drive.
-        let alive = 1.0 - (self.damage * 0.7).min(0.85);
+        // Power falls as the engine bay is crushed; a dead engine has none.
+        let alive = if self.engine < 0.15 { 0.0 } else { self.engine.max(0.3) };
         let n_drive = self.lost.iter().filter(|l| !**l).count().max(1) as f64;
         let (mut drive_f, mut brake) = (0.0, 0.0);
         if d.throttle > 0.05 {
             if fwd_speed < -1.0 { brake = d.throttle } else { drive_f = d.throttle * (kind.power * alive / fwd_speed.abs().max(6.0)).min(kind.mu * m * 9.81 * 0.95) };
         } else if d.throttle < -0.05 {
-            if fwd_speed > 1.0 { brake = -d.throttle } else { drive_f = d.throttle * (kind.power * 0.25 / fwd_speed.abs().max(4.0)).min(m * 4.0) };
+            if fwd_speed > 1.0 { brake = -d.throttle } else { drive_f = d.throttle * alive.min(1.0) * (kind.power * 0.25 / fwd_speed.abs().max(4.0)).min(m * 4.0) };
         }
         let mu = kind.mu * if water { 0.15 } else { 1.0 };
         let share = m / 4.0;
@@ -995,8 +1035,10 @@ impl Car {
             }
             let nf = nf.clamp(0.0, m * 9.81 * 3.0);
             let mut f = normal * nf;
-            // The tyre, in the ground's plane.
-            let steer = if w < 2 { self.steer } else { 0.0 };
+            // The tyre, in the ground's plane: steered, and knocked out of line by
+            // the crash (toed, a bent rim wobbling once a turn).
+            let steer = if w < 2 { self.steer } else { 0.0 } + self.toe[w] + self.wobble[w] * self.spin[w].sin();
+            self.vis_steer[w] = steer;
             let heading = self.rot * DQuat::from_rotation_y(-steer) * DVec3::NEG_Z;
             let wf = (heading - normal * heading.dot(normal)).normalize_or_zero();
             let wr = wf.cross(normal);
@@ -1016,6 +1058,10 @@ impl Car {
             if brake > 0.0 || rear_locked {
                 let b = if rear_locked { grip * 0.9 } else { brake * mu * nf * 0.95 };
                 fl -= vl.signum() * b.min(stop_l);
+            }
+            // A wheel bent into its arch drags.
+            if self.drag[w] > 0.0 {
+                fl -= vl.signum() * (self.drag[w] * 0.35 * mu * nf).min(stop_l);
             }
             if d.throttle.abs() < 0.05 {
                 // Off the gas: slowing, and holding still when parked.
@@ -1147,6 +1193,15 @@ impl Car {
             }
         }
         self.swing_parts(h, up);
+        // A damaged engine smokes; a dead one pours it out.
+        if self.engine < 0.6 {
+            self.smoke_t -= h;
+            if self.smoke_t <= 0.0 {
+                self.smoke_t = 0.04 + self.engine * 0.15;
+                let bay = self.origin() + self.rot * DVec3::new(0.0, self.hi.y as f64 * 0.55, self.lo.z as f64 * 0.7);
+                hits.push(Hit { pos: bay, normal: up, speed: (1.0 - self.engine) * 10.0, kind: HitKind::Smoke });
+            }
+        }
         // Sixty times a second the structure settles after what pushed it, and the mesh follows.
         if self.time - self.last_flush >= 1.0 / 60.0 {
             self.last_flush = self.time;
@@ -1178,12 +1233,13 @@ impl Car {
                 if !moved {
                     continue;
                 }
-                let off = (np - s.rest[k]).length();
-                // Crumpled metal catches the light unevenly.
-                let side = Vec3::new(hash(k as u32 ^ 0x9e37) - 0.5, hash(k as u32 ^ 0x51ed) - 0.5, hash(k as u32 ^ 0x2f1b) - 0.5);
-                let crinkle = side * (off * 3.0).min(1.0) * 0.9 + side * hash(k as u32) * (off * 0.25).min(0.08) * 0.0;
-                s.v[k].pos = (np + side * (off * 0.12).min(0.06)).into();
-                s.v[k].nrm = (s.nrm0[k] + crinkle).normalize_or_zero().into();
+                let (pos, nrm, col, metal) = crumple(s.rest[k], np, s.nrm0[k], s.col0[k], s.v[k].mat[0]);
+                s.v[k].pos = pos.into();
+                s.v[k].nrm = nrm.into();
+                s.v[k].col = col;
+                if metal {
+                    s.v[k].mat[0] = mat::STEEL;
+                }
                 touched = Some(touched.map_or((k, k + 1), |(a, b)| (a.min(k), b.max(k + 1))));
             }
             if let Some((a, b)) = touched {
@@ -1191,10 +1247,47 @@ impl Car {
             }
         }
         self.lattice.dirty.iter_mut().for_each(|d| *d = false);
-        // The damage is how much of the front's worth of crumpling is used up.
+        // The damage: how much of the whole structure's give is used up (half of it is a write-off).
         let used: f32 = (0..self.lattice.len()).map(|i| self.lattice.moved(i)).sum();
-        let front = self.lattice.rest.iter().filter(|p| p.z < self.lo.z + self.lattice.cell * 1.2).count().max(1) as f32;
-        self.damage = self.damage.max((used / (front * self.kind.crush[0] as f32 * 2.0)).min(1.0) as f64);
+        let room: f32 = self.lattice.max.iter().sum::<f32>().max(1e-3);
+        self.damage = self.damage.max((used / room / 0.5).min(1.0) as f64);
+        self.running_gear();
+    }
+
+    /// What the crumpled structure does to the driving: each wheel shoved with
+    /// the metal around it (the wheelbase that side shorter, the ride height
+    /// off, the wheel toed so the car pulls, a bent rim wobbling, a wheel jammed
+    /// in its arch dragging), the steering stiff when both front corners are
+    /// wrecked, and the engine as crushed as its bay.
+    fn running_gear(&mut self) {
+        for w in 0..4 {
+            let (mut d, mut sum) = (Vec3::ZERO, 0.0f32);
+            for &(i, wt) in &self.wheel_nodes[w] {
+                d += (self.lattice.pos[i] - self.lattice.rest[i]) * wt;
+                sum += wt;
+            }
+            let knock = if sum > 0.0 { (d / sum).clamp_length_max(0.35) } else { Vec3::ZERO };
+            self.knock[w] = knock.as_dvec3();
+            self.strut[w] = self.strut0[w] + self.knock[w];
+            // A wheel shoved back toes toward its own side: the car pulls that way.
+            let side = if w % 2 == 0 { -1.0 } else { 1.0 };
+            let front = if w < 2 { 1.0 } else { 0.6 };
+            self.toe[w] = (side * 0.3 * knock.z as f64 + side * 0.15 * (knock.x as f64 * -side)).clamp(-0.1, 0.1) * front;
+            let bent = knock.length() as f64;
+            self.wobble[w] = ((bent - 0.04).max(0.0) * 0.5).min(0.12);
+            self.drag[w] = ((bent - 0.12) / 0.2).clamp(0.0, 1.0);
+        }
+        let wrecked = (self.knock[0].length() + self.knock[1].length()) * 1.2;
+        self.steer_left = (1.0 - wrecked).clamp(0.35, 1.0);
+        if !self.engine_nodes.is_empty() {
+            let crushed = self.engine_nodes.iter().map(|&i| self.lattice.moved(i)).sum::<f32>() / self.engine_nodes.len() as f32;
+            self.engine = self.engine.min((1.0 - crushed as f64 / 0.5).clamp(0.0, 1.0));
+        }
+    }
+
+    /// Which way and how hard the car pulls with the wheels as they are (rad of toe, + right).
+    pub fn pull(&self) -> f64 {
+        self.toe.iter().sum()
     }
 
     fn refresh_near(&mut self, world: &World) {
@@ -1487,6 +1580,70 @@ fn box_mesh(h: Vec3, col: [f32; 3]) -> (Vec<PartVertex>, Vec<u32>) {
     (v, i)
 }
 
+/// Smooth noise in [0, 1] over space (value noise, trilinear).
+fn vnoise(p: Vec3) -> f32 {
+    let i = p.floor();
+    let f = p - i;
+    let u = f * f * (Vec3::splat(3.0) - 2.0 * f);
+    let h = |x: f32, y: f32, z: f32| hash((x as i32 as u32).wrapping_mul(73856093) ^ (y as i32 as u32).wrapping_mul(19349663) ^ (z as i32 as u32).wrapping_mul(83492791));
+    let l = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let (x0, y0, z0) = (i.x, i.y, i.z);
+    l(
+        l(l(h(x0, y0, z0), h(x0 + 1.0, y0, z0), u.x), l(h(x0, y0 + 1.0, z0), h(x0 + 1.0, y0 + 1.0, z0), u.x), u.y),
+        l(l(h(x0, y0, z0 + 1.0), h(x0 + 1.0, y0, z0 + 1.0), u.x), l(h(x0, y0 + 1.0, z0 + 1.0), h(x0 + 1.0, y0 + 1.0, z0 + 1.0), u.x), u.y),
+        u.z,
+    )
+}
+
+/// How a vertex of sheet metal looks once the structure under it has moved it
+/// from `rest` to `to`: its position, normal, colour and whether its paint has
+/// flaked to bare metal.
+///
+/// Pushed along its surface, metal does not just slide: it buckles into folds
+/// across the push, an accordion of sharp ridges about 13 cm apart, deeper the
+/// further it was pushed. The ridges wander (their phase follows smooth noise),
+/// and the normal is tilted by the slope of the fold, so each crease catches the
+/// light on one side and falls dark on the other. Pushed straight in, it dents,
+/// with a little smooth unevenness. Badly crushed paint cracks off.
+fn crumple(rest: Vec3, to: Vec3, n0: Vec3, col0: [f32; 4], id: f32) -> (Vec3, Vec3, [f32; 4], bool) {
+    let d = to - rest;
+    let off = d.length();
+    if off < 1e-4 {
+        return (to, n0, col0, false);
+    }
+    let dir = d / off;
+    // The part of the push that runs along the surface folds it.
+    let along = (dir - n0 * dir.dot(n0)).normalize_or_zero();
+    let sideways = 1.0 - dir.dot(n0).abs();
+    let amp = (off * 0.2).min(0.055) * (0.25 + 0.75 * sideways);
+    const WAVE: f32 = 0.13;
+    let phase = vnoise(rest * 2.3) * 2.0;
+    let s = rest.dot(along) / WAVE + phase;
+    // A triangle wave (sharp creases) with a little of a finer sine on it.
+    let fr = s - s.floor();
+    let tri = 4.0 * (fr - 0.5).abs() - 1.0;
+    let slope_tri = if fr < 0.5 { -4.0 } else { 4.0 } / WAVE;
+    let s2 = s * 2.7;
+    let fold = 0.75 * tri + 0.25 * (s2 * std::f32::consts::TAU).sin();
+    let slope = 0.75 * slope_tri + 0.25 * (s2 * std::f32::consts::TAU).cos() * std::f32::consts::TAU * 2.7 / WAVE;
+    // And smooth unevenness everywhere it moved.
+    let bump = (vnoise(rest * 6.0) - 0.5) * (off * 0.25).min(0.04);
+    let pos = to + n0 * (amp * fold + bump);
+    let nrm = (n0 - along * (amp * slope).clamp(-2.5, 2.5)).normalize_or_zero();
+    // Paint cracks off where it is crushed hardest (in patches).
+    let mut col = col0;
+    let mut metal = false;
+    if id == mat::PAINT && off > 0.12 {
+        let k = ((off - 0.12) / 0.25).clamp(0.0, 1.0) * (vnoise(rest * 11.0) * 1.6 - 0.3).clamp(0.0, 1.0);
+        let bare = [0.52, 0.52, 0.54];
+        for c in 0..3 {
+            col[c] = col0[c] + (bare[c] - col0[c]) * k;
+        }
+        metal = k > 0.6;
+    }
+    (pos, nrm, col, metal)
+}
+
 fn hash(x: u32) -> f32 {
     let mut h = x.wrapping_mul(0x9E37_79B9) ^ 0x85EB_CA6B;
     h ^= h >> 15;
@@ -1509,6 +1666,11 @@ pub fn particles(hits: &[Hit], rng: &mut Rng, out: &mut Vec<(DVec3, Particle)>) 
                     out.push((hit.pos, Particle { vel: (d * rng.range(3.0, 10.0) * (s / 15.0).min(1.5)).into(), life: rng.range(0.3, 0.9), size0: rng.range(0.03, 0.07), size1: 0.02, kind: SPARK, drag: 0.6, seed: rng.f(), alpha: rng.range(0.5, 1.0), ..Default::default() }));
                 }
                 out.push((hit.pos, Particle { vel: (up * 1.0).into(), life: rng.range(1.5, 3.0), size0: 0.5, size1: 2.5, kind: DUST, drag: 1.5, buoy: 0.5, seed: rng.f(), alpha: 0.25, ..Default::default() }));
+            }
+            HitKind::Smoke => {
+                // Grey from a hurt engine, dark from a dead one.
+                let dark = (s / 10.0).clamp(0.0, 1.0);
+                out.push((hit.pos, Particle { vel: (up * rng.range(1.0, 2.5) + Vec3::new(rng.range(-0.4, 0.4), rng.range(-0.4, 0.4), rng.range(-0.4, 0.4))).into(), life: rng.range(2.5, 4.5), size0: rng.range(0.25, 0.45), size1: rng.range(2.0, 3.5), kind: DUST, drag: 1.0, buoy: 1.2 + dark, seed: rng.f(), alpha: 0.25 + 0.35 * dark, ..Default::default() }));
             }
             HitKind::Glass => {
                 for _ in 0..40 {
@@ -1635,6 +1797,50 @@ mod tests {
         assert!(g.cars[0].deepest_dent() < 1e-6 && g.cars[0].damage == 0.0 && g.cars.len() == 1);
         assert!(g.debris.is_empty(), "the parts lying about came back with the reset");
         assert!(g.cars[0].part_states().iter().all(|p| p.1 == PartState::Latched));
+    }
+
+    /// Straight from `p` (north, wheel centred) at part throttle for `secs`: how far
+    /// the heading has wandered (rad, + right) and the speed reached.
+    fn drive_straight(g: &mut Garage, w: &World, p: DVec3, secs: f64) -> (f64, f64) {
+        let (e, n, u) = geo::enu(p);
+        let c = &mut g.cars[0];
+        c.pos = p + u * (c.kind.cg + 0.05);
+        c.rot = DQuat::from_mat3(&DMat3::from_cols(e, u, -n));
+        c.launch(DVec3::ZERO);
+        c.w = DVec3::ZERO;
+        run(g, w, 1.0, Drive::default());
+        run(g, w, secs, Drive { throttle: 0.6, ..Default::default() });
+        let c = &g.cars[0];
+        let f = c.forward();
+        (f.dot(e).atan2(f.dot(n)), c.speed())
+    }
+
+    #[test]
+    fn crash_damage_changes_the_driving() {
+        let w = flat_world();
+        let p = geo::lla_to_pos(0.6, -2.1, 0.0);
+        let (e, n, u) = geo::enu(p);
+        // As new it runs straight.
+        let mut g = Garage::default();
+        g.spawn(0, p, 0.0, &w);
+        let (drift0, v0) = drive_straight(&mut g, &w, p, 5.0);
+        // Into a wall with the left front corner at 45 km/h.
+        let mut g = Garage::default();
+        g.spawn(0, p, 0.0, &w);
+        g.walls.push(Wall::new(p + n * 15.0 - e * 1.4 + u * 1.5, e, u, DVec3::new(0.9, 1.5, 0.5)));
+        run(&mut g, &w, 1.0, Drive::default());
+        g.cars[0].launch(n * 12.5);
+        run(&mut g, &w, 2.5, Drive::default());
+        g.walls.clear();
+        let c = &g.cars[0];
+        println!("after the hit: knock FL {:.2} m, toe {:?}, engine {:.2}, steering left {:.2}, pull {:.3} rad, damage {:.2}", c.knock[0].length(), c.toe.map(|t| (t * 100.0).round() / 100.0), c.engine, c.steer_left, c.pull(), c.damage);
+        assert!(c.body.v.iter().chain(&c.glass.v).all(|v| Vec3::from(v.pos).is_finite() && Vec3::from(v.nrm).is_finite()), "the crumpled mesh has NaNs");
+        let (drift1, v1) = drive_straight(&mut g, &w, p + e * 40.0, 5.0);
+        println!("drift as new {:.1}°, after {:.1}°; speed as new {v0:.1} m/s, after {v1:.1}", drift0.to_degrees(), drift1.to_degrees());
+        assert!(drift0.abs() < 0.03, "a new car wanders {:.1}°", drift0.to_degrees());
+        assert!(drift1 < -0.08, "the damaged car does not pull left ({:.1}°)", drift1.to_degrees());
+        let engine = g.cars[0].engine;
+        assert!(engine < 0.95 && v1 < v0, "the engine took nothing (engine {engine:.2}, {v1:.1} vs {v0:.1} m/s)");
     }
 
     #[test]
