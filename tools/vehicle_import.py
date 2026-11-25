@@ -257,7 +257,7 @@ def car(path, key, fwd, length=None, paint=None):
                 lum = col[:, :3].mean(1, keepdims=True)
                 shade = lum / max(float(lum.mean()), 1e-3) if lum.mean() > 0.02 else np.ones_like(lum)
                 col[:, :3] = np.clip(np.array(paint) * np.clip(shade, 0.3, 1.6), 0, 1)
-            parts.append((P, N, col, gm, tris, wheel))
+            parts.append((P, N, col, gm, tris, wheel, joined))
     allp = np.concatenate([p[0] for p in parts])
     lo, hi = allp.min(0), allp.max(0)
     if length:
@@ -280,7 +280,7 @@ def car(path, key, fwd, length=None, paint=None):
         ext = P.max(0) - P.min(0)
         if pt[5] and abs(c[0]) > 0.25 * size[0] and ext.max() < 0.3 * size[2]:
             k = (0 if c[2] < 0 else 2) + (0 if c[0] < 0 else 1)
-            corners[k].append(pt)
+            corners[k].append(pt + (0,))
         else:
             body.append(pt)
     hubs = []
@@ -293,16 +293,56 @@ def car(path, key, fwd, length=None, paint=None):
         r = (b[1] - a[1]) / 2
         hubs.append((hub, r))
         print(f"  wheel {['FL', 'FR', 'RL', 'RR'][k]}: hub {hub.round(3)}, radius {r:.3f}")
+    # The parts that swing open or come off: each body piece goes to the part its
+    # name and place say it is (or stays with the body), and each part gets a hinge.
+    slots = {}
+    tagged = []
+    for pt in body:
+        P = pt[0]
+        c = (P.min(0) + P.max(0)) / 2
+        crel = np.array([c[0] / size[0], (c[1] - size[1] / 2) / size[1], c[2] / size[2]])
+        erel = (P.max(0) - P.min(0)) / size
+        slot = part_slot(pt[6], crel, erel)
+        pid = 0
+        if slot is not None:
+            pid = slots.setdefault(slot, len(slots) + 1)
+        tagged.append(pt + (pid,))
+    body = tagged
+    table = []
+    for slot, pid in sorted(slots.items(), key=lambda kv: kv[1]):
+        P = np.concatenate([p[0] for p in body if p[7] == pid])
+        a, b = P.min(0), P.max(0)
+        c = (a + b) / 2
+        kind, where = slot
+        if kind == "door":
+            # Hinged on its front edge, swinging out.
+            hinge = (1, (c[0], c[1], a[2]), (0, 1, 0), 1.0 if c[0] > 0 else -1.0, 1.15)
+        elif kind == "hood":
+            # Hinged at the windscreen, the front edge lifting.
+            hinge = (2, (0, b[1], b[2]), (1, 0, 0), 1.0, 1.3)
+        elif kind == "lid" and (b[1] - a[1]) > (b[2] - a[2]):
+            # A tailgate: hinged along its bottom, falling open backwards.
+            hinge = (3, (0, a[1], c[2]), (1, 0, 0), 1.0, 1.57)
+        elif kind == "lid":
+            # An engine cover or boot lid behind the cabin: hinged at its front edge.
+            hinge = (4, (0, b[1], a[2]), (1, 0, 0), -1.0, 1.2)
+        else:
+            # Bolted on: bumpers and mirrors.
+            hinge = (5 if kind == "bumper" else 6, tuple(c), (1, 0, 0), 0.0, 0.0)
+        name = f"{kind} {where}"
+        table.append((name, hinge, a, b))
+        print(f"  part {pid}: {name}, {len(P)} vertices, hinge at {np.round(hinge[1], 2)}")
     out = io.BytesIO()
     out.write(b"VEH1")
     out.write(struct.pack("<I", 5))
-    meta = {"size": size.tolist()}
+    meta = {"size": size.tolist(), "parts": len(table)}
     groups = [(body, np.zeros(3), 0.0)] + [(corners[k], hubs[k][0], hubs[k][1]) for k in range(4)]
     for pieces, hub, r in groups:
         P = np.concatenate([p[0] for p in pieces]) - hub
         N = np.concatenate([p[1] for p in pieces])
         C = np.concatenate([p[2] for p in pieces])
         M = np.concatenate([np.full(len(p[0]), p[3]) for p in pieces])
+        PID = np.concatenate([np.full(len(p[0]), p[7]) for p in pieces])
         T, base = [], 0
         for p in pieces:
             T.append(p[4] + base)
@@ -312,7 +352,7 @@ def car(path, key, fwd, length=None, paint=None):
         used = np.zeros(len(P), bool)
         used[T.reshape(-1)] = True
         remap = np.cumsum(used) - 1
-        P, N, C, M, T = P[used], N[used], C[used], M[used], remap[T]
+        P, N, C, M, PID, T = P[used], N[used], C[used], M[used], PID[used], remap[T]
         out.write(struct.pack("<3ff", *hub, r))
         out.write(struct.pack("<I", len(P)))
         vb = np.zeros(len(P), dtype=[("p", "<f4", 3), ("n", "i1", 3), ("m", "u1"), ("c", "u1", 4)])
@@ -321,15 +361,40 @@ def car(path, key, fwd, length=None, paint=None):
         vb["m"] = M
         rgb = lin_to_srgb(C[:, :3])
         vb["c"][:, :3] = np.round(rgb * 255)
-        vb["c"][:, 3] = np.round(np.clip(C[:, 3], 0, 1) * 255)
+        # (The fourth byte is which part the vertex belongs to, 0 the body.)
+        vb["c"][:, 3] = PID
         out.write(vb.tobytes())
         out.write(struct.pack("<I", T.size))
         out.write(T.astype("<u4").tobytes())
+    # The parts table: kind, name, hinge point, axis, the way it opens, how far, its box.
+    out.write(b"PRT1")
+    out.write(struct.pack("<I", len(table)))
+    for name, (kind, pivot, axis, sign, most), a, b in table:
+        nb = name.encode()
+        out.write(struct.pack("<BB", kind, len(nb)) + nb)
+        out.write(struct.pack("<3f3fff3f3f", *pivot, *axis, sign, most, *a, *b))
     os.makedirs("assets/vehicles", exist_ok=True)
     dst = f"assets/vehicles/{key}.bin.gz"
     with gzip.open(dst, "wb", 9) as fz:
         fz.write(out.getvalue())
     print(f"  wrote {dst} ({os.path.getsize(dst) / 1e6:.1f} MB)", json.dumps(meta))
+
+
+def part_slot(name, c, e):
+    """Which part a piece is, from its node names, centre and size (both as fractions
+    of the car's): (kind, where) or None for the body."""
+    n = name.lower()
+    side = "left" if c[0] < 0 else "right"
+    if "door" in n and abs(c[0]) > 0.25 and e[0] < 0.2:
+        rear = re.search(r"door[_ ]?(b[lr]|r[lr]|[lr]r)(?![a-z])|rear|door_[dp]side_r", n)
+        return ("door", f"{side} {'rear' if rear else 'front'}")
+    if "mirror" in n and abs(c[0]) > 0.3:
+        return ("mirror", side)
+    if "bumper" in n:
+        return ("bumper", "front" if c[2] < 0 else "rear")
+    if re.search(r"hood|bonnet|boot|trunk|tailgate|engine.?cover|hatch|lid", n) and abs(c[0]) < 0.15 and e[1] < 0.35:
+        return ("hood", "front") if c[2] < 0 else ("lid", "rear")
+    return None
 
 
 # ---------------------------------------------------------------- the pilot

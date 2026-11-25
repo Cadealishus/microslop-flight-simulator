@@ -4567,7 +4567,14 @@ impl Game {
                             let name = ["FL", "FR", "RL", "RR"][w];
                             shadow(ui, if lost { format!("{name} gone") } else { format!("{name} spring {:>3.0}%{}", (rest - len) / rest * 100.0, if grounded { "" } else { "  air" }) }, 12.0, dim);
                         }
-                        shadow(ui, format!("contacts {}   time x{}", c.debug.contacts.len(), self.slowmo), 12.0, dim);
+                        for (name, state, angle) in c.part_states() {
+                            match state {
+                                vehicle::PartState::Swinging => shadow(ui, format!("{name} open {:.0}°", angle.to_degrees()), 12.0, Color32::from_rgb(255, 200, 60)),
+                                vehicle::PartState::Gone => shadow(ui, format!("{name} gone"), 12.0, Color32::from_rgb(255, 90, 70)),
+                                vehicle::PartState::Latched => {}
+                            }
+                        }
+                        shadow(ui, format!("contacts {}   debris {}   time x{}", c.debug.contacts.len(), self.garage.debris.len(), self.slowmo), 12.0, dim);
                         for (t, kind, v) in c.debug.hits.iter().rev().take(5) {
                             shadow(ui, format!("{:>6.2}s {:?} {:.1} m/s", t, kind, v), 12.0, dim);
                         }
@@ -5378,14 +5385,14 @@ impl Game {
                 match vehicle::KINDS.iter().position(|k| k.key == key) {
                     Some(k) => {
                         let i = self.garage.spawn(k, at, heading, &self.world);
-                        self.garage.cars[i].vel = flat * speed;
+                        self.garage.cars[i].launch(flat * speed);
                         self.seat = Seat::Car(i);
                         self.pilot.shown = false;
                         if self.crashtest {
                             // A concrete wall 40 m ahead, square across the car's path.
                             let start = self.garage.cars[i].origin();
                             let u = start.normalize();
-                            let wall = vehicle::Wall::new(start + flat * 40.0 + u * 1.5, DQuat::from_mat3(&glam::DMat3::from_cols(u.cross(flat), u, flat)), DVec3::new(7.0, 1.5, 0.6));
+                            let wall = vehicle::Wall::new(start + flat * 40.0 + u * 1.5, flat.cross(u), u, DVec3::new(7.0, 1.5, 0.6));
                             self.garage.walls = vec![wall];
                             self.crash_start = Some((start, heading, speed));
                             self.hint("Crash test: R runs it again, O slow motion, F4 the physics overlay", 6.0);
@@ -5481,7 +5488,8 @@ impl Game {
         }
         self.garage.reset(0, at, heading, &self.world);
         let c = &mut self.garage.cars[0];
-        c.vel = c.forward() * speed;
+        let v = c.forward() * speed;
+        c.launch(v);
         self.seat = Seat::Car(0);
         self.crash_report_at = None;
         self.r.clear_particles();
@@ -5501,9 +5509,10 @@ impl Game {
             let impact = c.debug.hits.iter().map(|h| h.2).fold(0.0, f64::max);
             let (start, ..) = self.crash_start.unwrap_or((c.pos, 0.0, 0.0));
             let travelled = (c.origin() - start).length();
+            let parts: Vec<String> = c.part_states().into_iter().filter(|p| p.1 != vehicle::PartState::Latched).map(|p| format!("{} {}", p.0, if p.1 == vehicle::PartState::Gone { "off" } else { "open" })).collect();
             log::info!(
-                "crash test {}: hardest hit {:.1} m/s, peak {:.0} g, damage {:.0}%, deepest dent {:.2} m, {} glass triangles burst, {} wheels off, {:.1} m from the start, now {:.1} m/s, upright {:.2}",
-                c.kind.key, impact, c.debug.g_peak, c.damage * 100.0, c.deepest_dent(), c.debug.glass_broken, c.wheels_lost(), travelled, c.speed(), c.up().dot(c.pos.normalize())
+                "crash test {}: hardest hit {:.1} m/s, peak {:.0} g, damage {:.0}%, deepest dent {:.2} m, {} glass triangles burst, {} wheels off, parts [{}], {:.1} m from the start, now {:.1} m/s, upright {:.2}",
+                c.kind.key, impact, c.debug.g_peak, c.damage * 100.0, c.deepest_dent(), c.debug.glass_broken, c.wheels_lost(), parts.join(", "), travelled, c.speed(), c.up().dot(c.pos.normalize())
             );
         }
     }
